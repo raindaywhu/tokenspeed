@@ -117,26 +117,21 @@
 - `event_loop.py` 对 `DeepseekV4TokenToKVPool` + `enable_kvstore` 仍抛 `NotImplementedError`。
 - `DeepseekV4TokenToKVPool.offload()` / `reload()` 明确未实现。
 - DeepSeek V4 attention backend 有大量模型本地 metadata、paged cache table、compressed slot mapping、SWA/CSA decode/prefill 逻辑。
-- vLLM 已支持 TokenSpeed 相关 MLA 算子路径，因此单个 MLA kernel 不应被作为最大护城河。
+- vLLM 主线已有 MLA / DeepSeek V4 相关 KV cache spec 与 runtime 支持，因此单个 MLA kernel 不应被作为最大护城河。
 
-## 2. 已经确认的负面结论
+## 2. 已确认边界与证据链
 
-这些结论需要在 PPT 中明确写出，避免过度包装：
+这些不是“负面评价”，而是为了避免把尚未证实的能力写成既有事实。每条判断都需要同时说明代码证据和推理边界。
 
-1. **没有看到 tool-call-specific DDR KV offload。**  
-   Tool call 相关处理目前主要在 chat template、stop token、normal finish path。没有看到专门的 `ToolCallEvent -> 将该 request KV 下沉 DDR` 策略。
+| 判断 | TokenSpeed 代码证据 | 反向搜索 / 对照证据 | 推理边界 |
+|---|---|---|---|
+| 没有看到 tool-call-specific DDR KV offload | `python/tokenspeed/runtime/utils/hf_transformers_utils.py` 中 DeepSeek V4 tokenizer 只在 `tools` 存在时把 tools 注入 system message；同文件 `attach_additional_stop_token_ids()` 处理 `<|eom_id|>` stop token。`python/tokenspeed/runtime/grammar/core_types.py` 定义的是 tool call payload 解析结构。 | 在 runtime / scheduler / cache 相关路径中没有看到 `ToolCallEvent`、tool-call 专用 cache op、或“tool call 后将该 request KV 下沉 DDR”的策略入口。 | 只能说“当前已读代码未发现专用 tool-call DDR offload”。不能排除未来分支或外部系统有该策略；也不能把 normal finish / retract writeback 误写成 tool-call 专用机制。 |
+| DeepSeek V4 hierarchical KVStore 当前不能作为短期收益 | `docs/serving/deepseek-v4.md` 示例命令包含 `--disable-kvstore`。`python/tokenspeed/runtime/engine/event_loop.py` 对 `DeepseekV4TokenToKVPool + enable_kvstore` 抛 `NotImplementedError`。`python/tokenspeed/runtime/layers/attention/kv_cache/deepseek_v4.py` 的 `get_cpu_copy()` / `load_cpu_copy()` 明确未实现。 | TokenSpeed 通用 runtime 有 MemoryExecutor / HostExecutor / kvstore 架构，但 DeepSeek V4 KV pool 是例外路径。 | 可以分析通用 hierarchical cache 设计，但不能把 V4 当前 PoC 的收益归因到 L2/DDR/L3 writeback/loadback。 |
+| DeepSeek V4 不是已确认的 generic placement compiler 主路径 | `python/tokenspeed/runtime/models/deepseek_v4.py` 中 decoder layer 显式构造 `CommManager`。`python/tokenspeed/runtime/models/base/decoder_layer.py` 注释说明 `CompiledDecoderLayer` 才走 compiler-driven path。`python/tokenspeed/runtime/models/base/transformer_model.py` 只编译 `isinstance(layer, CompiledDecoderLayer)` 的层。 | `runtime/models/base/{placement.py,compiler.py,execution.py}` 确实提供 placement compiler，但这是通用基础设施，不等价于 V4 当前主路径。 | 可以说 placement compiler 是并行策略系统化表达的候选能力；不能说 DeepSeek V4 性能主要来自 generic local-SPMD compiler。 |
+| MoE TP + EP 不能写成任意组合 | `python/tokenspeed/runtime/utils/server_args.py` 在 `mapping.moe.has_tp and mapping.moe.has_ep` 时抛 `ValueError`。`python/tokenspeed/runtime/layers/moe/layer.py` 也明确 `Mixed TP and EP is not supported yet.` | TokenSpeed 仍支持 attention/dense/MoE 跨 layer family 的 split strategy；限制的是 MoE 内部 TP 和 EP 同时大于 1。 | 应写成“跨 layer family 的 parallel domain 可分开配置”，不要写成“MoE 内部 TPxEP 任意组合”。 |
+| MLA kernel 不是最大护城河 | TokenSpeed 有 `tokenspeed-mla/`、DeepSeek V4 attention backend、compressed KV layout 等实现。 | vLLM 主线已有 `MLAAttentionSpec`、DeepSeek V4 KV cache config、MLA worker/runtime 相关路径。 | 单 kernel/单 backend 的复制难度下降；仍值得分析的是端到端 latent-KV metadata、paged cache layout、prefill/decode 切换和 scheduler 物化关系。 |
 
-2. **DeepSeek V4 hierarchical KVStore 当前不能作为短期收益。**  
-   当前分支仍要求 DeepSeek V4 baseline 禁用 kvstore，V4 KV pool offload/reload 未实现。
-
-3. **DeepSeek V4 不是已确认的 generic placement compiler 主路径。**  
-   placement compiler 重要，但当前 V4 更依赖手写模型路径和 `CommManager`。
-
-4. **MoE TP + EP 不能随意组合。**  
-   源码有显式禁止 mixed TP/EP 的检查。报告应说 TokenSpeed 支持跨 layer family 的 split strategy，而不是 MoE 内部任意多维并行。
-
-5. **MLA kernel 不是最大护城河。**  
-   vLLM 已经吸收相关算子，剩余价值是端到端 latent-KV execution，而不是单 kernel。
+vLLM 对照证据来自主线快照 `9640970` 的 `vllm/v1/core/sched/scheduler.py`、`vllm/v1/core/kv_cache_manager.py`、`vllm/v1/core/block_pool.py`、`vllm/v1/core/kv_cache_utils.py` 和 `vllm/v1/worker/gpu_model_runner.py`。这些证据只用于建立 baseline，不把本报告扩展成 vLLM 架构深挖。
 
 ## 3. 仍需要继续读的代码
 
@@ -186,7 +181,7 @@ layer segment -> input placement -> collective -> output placement -> bytes/toke
 
 ### 3.5 vLLM-Ascend 可复制性对照
 
-当前不需要继续深挖 vLLM 主实现，但 PPT 仍需要一个复制难度矩阵：
+当前不需要继续深挖 vLLM 主实现，但正式报告仍需要一个复制难度矩阵：
 
 | TokenSpeed 机制 | vLLM/vLLM-Ascend 复制级别 | 需要判断的问题 |
 |---|---|---|
@@ -200,7 +195,7 @@ layer segment -> input placement -> collective -> output placement -> bytes/toke
 
 ## 4. 下一轮研究产物建议
 
-建议下一轮不要继续扩散到所有模块，而是集中产出三张能直接进 PPT 的图/表：
+建议下一轮不要继续扩散到所有模块，而是集中产出三张可复用的架构图/表：
 
 1. **TokenSpeed runtime 组件图**  
    必须同时画出 Main Python、DP Controller、Scheduler Worker、C++ Scheduler、GPU execution plane。
@@ -211,4 +206,4 @@ layer segment -> input placement -> collective -> output placement -> bytes/toke
 3. **DeepSeek V4 并行账本**  
    attention / dense / MoE 每段的 group、collective、token count、可能收益、复制难度。
 
-这三张图完成后，PPT 的深度才会从“功能说明”变成“系统机制解释”。
+这三张图完成后，文档的深度才会从“功能说明”变成“系统机制解释”。

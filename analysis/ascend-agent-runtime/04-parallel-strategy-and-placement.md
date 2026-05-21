@@ -517,7 +517,7 @@ TokenSpeed 目前有两条路径：
 
 DeepSeek V4 并没有走 base compiler，而是自定义 decoder layer，里面仍然直接使用 `CommManager`。
 
-所以 PPT 里不能把“local-SPMD”讲成 TokenSpeed 对 V4 的唯一实现机制。更准确的讲法是：
+所以报告里不能把“local-SPMD”讲成 TokenSpeed 对 V4 的唯一实现机制。更准确的讲法是：
 
 > 并行策略是“怎么切”；CommManager 和 placement compiler 是“如何把切分落到模型层通信边界”。DeepSeek V4 当前更依赖手写模型路径；compiler 的价值在于未来把这类手写逻辑收敛成可复用的模型层协议。
 
@@ -771,7 +771,7 @@ TokenSpeed 的实现把 MoE 策略分成：
 
 ## 10. 性能收益模型：不能把几个优化点简单相加
 
-这一章是后续 PPT 必须有的“性能账本”。建议用瓶颈迁移模型，而不是把每项收益直接相加。
+这一章是正式技术解读必须有的“性能账本”。建议用瓶颈迁移模型，而不是把每项收益直接相加。
 
 ### 10.1 单步延迟拆解
 
@@ -847,7 +847,7 @@ Scheduler/KV 深挖回答的是 `T_scheduler_gap`、KV reuse、overlap。
 
 如果 baseline 没有等价低延迟 MoE dispatch-combine，理论差距可以超过 30%，但这时收益不应全部归功于“并行策略实现”，而是 MoE backend / all-to-all / kernel 共同造成。
 
-因此 PPT 里建议用这样的归因：
+因此报告里建议用这样的归因：
 
 ```text
 Scheduler/KV:
@@ -1022,7 +1022,7 @@ TokenSpeed 的 DeepSeek V4 已经把这些 patch 写得很深：
 
 如果只看到单个 MLA/kernel 带来的收益，而并行策略 ablation 没有收益，则应该优先反哺 vLLM-Ascend，而不是完整适配 TokenSpeed。
 
-## 14. 本章对 PPT 大纲的改写建议
+## 14. 本章对技术报告结构的改写建议
 
 原先“并行策略实现”和“local-SPMD”要拆开，但关系要讲准：
 

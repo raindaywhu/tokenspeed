@@ -56,9 +56,9 @@ prefix match
   -> later loadback / recovery
 ```
 
-## 2. 优化一：KV ownership 写进 C++ Request FSM，而不是散落在 cache manager 里
+## 2. 对照一：KV ownership 写进 C++ Request FSM，而不是停留在 block manager 语义
 
-### 2.1 具体实现
+### 2.1 TokenSpeed 具体实现
 
 TokenSpeed 的 C++ request state 不是普通枚举。状态对象直接携带资源所有权：
 
@@ -79,7 +79,29 @@ TokenSpeed 的 C++ request state 不是普通枚举。状态对象直接携带�
 
 这意味着 KV page 的生命周期不是“谁记得释放谁释放”，而是被 C++ 类型系统和 move 语义管住。
 
-### 2.2 为什么对 agent 场景重要
+### 2.2 vLLM / vLLM-Ascend 对照基线
+
+这里的对照对象不是一个抽象的“普通 cache manager”，而是 vLLM V1 当前主线的 scheduler / KV cache 结构。本文对照的是 vLLM 主线快照 `9640970` 中的 V1 scheduler/KV 代码，只作为必要 baseline，不展开成 vLLM 深挖。
+
+- `vllm/v1/core/sched/scheduler.py` 的 `Scheduler.schedule()` 负责请求队列、token budget、chunked prefill、spec decode、preemption，并输出 `SchedulerOutput`。
+- `vllm/v1/core/kv_cache_manager.py` 的 `KVCacheManager` 负责 `get_computed_blocks()`、`allocate_slots()`、`cache_blocks()`、`free()` 和 prefix cache stats。
+- `vllm/v1/core/block_pool.py` 的 `BlockPool` 管理 `KVCacheBlock`、free block queue、prefix-cache hash map。
+- `vllm/v1/core/kv_cache_utils.py` 的 `KVCacheBlock` 主要持有 `block_id`、`ref_cnt`、`block_hash` 和 free-list 指针。
+- 当 `allocate_slots()` 返回 `None` 时，vLLM scheduler 会 preempt running request；`_preempt_request()` 调用 `kv_cache_manager.free(request)`，把 request 状态设为 `PREEMPTED`，并把 `num_computed_tokens` 置 0 后放回 waiting queue。
+
+这个 baseline 说明 vLLM 并不是“没有 prefix cache / 没有 preemption”。它有成熟的 block manager、prefix hash、KV block ref count、preemption、external KV connector 入口和 MLA/DeepSeek V4 KV cache spec。本文要比较的不是功能有无，而是语义边界：
+
+| 维度 | vLLM V1 baseline | TokenSpeed 当前实现 |
+|---|---|---|
+| 请求状态 | scheduler 维护 waiting/running/preempted/finished 等请求状态 | C++ Request FSM 状态对象直接携带 KV page / node ref / req pool / transfer pairs |
+| KV ownership | `KVCacheManager` / `BlockPool` 管 block 分配、prefix hash、ref count | `OwnedPages`、`LocalKVAllocator`、`DeviceNodeRef` / `HostNodeRef` 随 FSM transition 迁移 |
+| prefix cache | `get_computed_blocks()` 找最长 cached blocks，`cache_blocks()` 缓存 full blocks | `schedulePrefillFirstChunk()` 同时区分 device depth / host depth / loadback diff |
+| preemption | `_preempt_request()` free KV blocks，request 回 waiting，后续按 prefix/cache 重算或命中恢复 | `ScheduleRetractEvent` 将可恢复 KV 转成 host/device tree state，进入 `Retracting/Retracted` |
+| cache movement | 通过 KV connector / P-D / external computed tokens 等机制表达外部 KV | Scheduler 同一轮 `ExecutionPlan` 同时返回 `ForwardOp + CacheOp`，cache event 再推进 FSM |
+
+所以，TokenSpeed 的潜在优势不是“vLLM 没有 KV cache”，而是它把更多 KV 生命周期语义放进 scheduler FSM 和 execution plan 里。如果 vLLM/vLLM-Ascend 要复制这一层，需要改的是 scheduler、KV cache manager、worker loop 和 cache transfer 事件之间的协议，而不只是增加一个 prefix cache 开关。
+
+### 2.3 为什么对 agent 场景重要
 
 Agent 场景里，一个请求很容易处于“半完成、可继续、可取消、可恢复”的状态。例如 tool call 之后会再次携带历史 prefix；长 session 可能在 KV 紧张时被暂时挪走；用户取消时不能再继续烧 decode step。
 
@@ -100,9 +122,9 @@ Submitted
   -> Retracting -> Retracted -> Decoding
 ```
 
-这就是它相对普通 KV cache manager 的核心差异：**FSM 状态本身就是资源所有者**。
+这就是它相对 vLLM V1 block-manager baseline 的核心差异：**TokenSpeed 的 FSM 状态本身就是资源所有者**。vLLM 的 block manager 已经很强，但 request lifecycle 与“device/host node ref、request-local allocator、writeback pairs、retract recovery”之间不是同一种状态机表达。
 
-### 2.3 vLLM 复制难度
+### 2.4 vLLM / vLLM-Ascend 复制难度
 
 单独复制一个 prefix cache 或 page allocator 不难；难的是把 request state、KV block manager、async transfer、preemption/recovery、output feedback 都改成同一套 ownership protocol。
 
@@ -115,7 +137,7 @@ Submitted
 | Draining/WritingBack/Retracting/Retracted 状态 | 高 | 触碰 scheduler、KV manager、worker loop |
 | 完整 request FSM + RAII ownership | 高 | 架构级复制，不是 config patch |
 
-## 3. 优化二：prefix reuse 同时看 device / host depth，并把 loadback 编入调度计划
+## 3. 对照二：prefix reuse 同时看 device / host depth，并把 loadback 编入调度计划
 
 ### 3.1 具体实现
 
@@ -156,11 +178,11 @@ host_matched   = match_result.host.DepthInPage();
 
 这说明 TokenSpeed 不是等 forward 执行时才发现缺 KV，而是在 scheduler 生成 plan 时就把 cache movement 编进去。
 
-### 3.2 对 agent workload 的价值
+### 3.2 相对 vLLM baseline 的差异
 
 多轮 agent session 的典型情况是：prefix 很长，新增 token 很少。真正影响 TTFT 的不是 prompt 总长度，而是“重复 prefix 能不能少算、能不能及时回到 device”。
 
-TokenSpeed 的优势在于：
+相对 vLLM V1 的 `KVCacheManager.get_computed_blocks()` 返回本地 prefix-cache computed blocks、`allocate_slots()` 为新 tokens 分配 slots、外部 KV 通过 connector / external computed tokens 进入调度的 baseline，TokenSpeed 这一段的潜在优势在于：它在同一个 C++ schedule decision 中同时处理 device prefix、host prefix、loadback、page admission 和本轮 forward window。
 
 ```text
 同一次 schedule 决策里同时回答：
@@ -178,6 +200,8 @@ ForwardOp: 只计算未命中的 prefill window
 CacheOp:   同时提交 host -> device loadback
 ```
 
+这个差异不是说 vLLM 不能做外部 KV 或 P/D KV transfer，而是说 TokenSpeed 把 device/host cache depth 和 loadback diff 作为 scheduler FSM 的一等输入，并把 loadback 与 forward 放进同一个 `ExecutionPlan`。如果 vLLM/vLLM-Ascend 要复制，需要把 connector / cache transfer 的完成事件与 scheduler block lifecycle 更紧地合并，而不是只在 backend 层补一个拷贝函数。
+
 ### 3.3 需要注意的限制
 
 当前 DeepSeek V4 baseline 对 hierarchical kvstore 明确有限制：
@@ -185,7 +209,7 @@ CacheOp:   同时提交 host -> device loadback
 - `event_loop.py:237-246` 判断 `DeepseekV4TokenToKVPool` 后，如果 `enable_kvstore` 为真，会抛 `NotImplementedError`，要求 `--disable-kvstore`。
 - 因此，**host/L2/L3 loadback/writeback 不能直接作为 DeepSeek V4 当前可用收益**。
 
-更准确的 PPT 表述应是：
+更准确的正式表述应是：
 
 ```text
 TokenSpeed 的通用 runtime 已经把 device/host/L3 KV movement 编入 scheduler plan；
@@ -751,9 +775,9 @@ agent runtime
   - p50/p95/p99 ITL
 ```
 
-## 13. 对 PPT 的组织建议
+## 13. 技术解读组织建议
 
-如果把这部分做成 PPT，不应该做成“TokenSpeed 支持 prefix cache / retract / kvstore”的列表，而应该按机制链条讲：
+这部分不应该写成“TokenSpeed 支持 prefix cache / retract / kvstore”的列表，而应该按机制链条讲：
 
 1. **Agent KV 问题不是长上下文，而是多轮短 decode + KV pressure**
    - 讲 repeated prefix、short decode、request churn、DP cache skew。
@@ -805,4 +829,3 @@ host-backed recoverable state，而不是简单 preempt 后重算。
 - 短期不要把 DeepSeek V4 hierarchical kvstore 收益算进去，因为当前 TokenSpeed V4 path 禁用 kvstore；
 - 优先验证 device KV ownership、prefix safe reuse、tail page / reserve、retract/recovery 语义、DP cache-aware dispatch；
 - 如果 repeated-prefix + KV-pressure agent trace 下，TokenSpeed 相比 vLLM-Ascend 改善 p95/p99 且不靠单个 MLA kernel，那么 Scheduler/KV ownership 才能成立为核心护城河候选。
-

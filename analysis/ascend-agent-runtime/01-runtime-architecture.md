@@ -14,7 +14,7 @@ TokenSpeed 的架构中心不是某个 kernel，也不是一个单独的 schedul
 4. **嵌入 worker 内的 C++ Scheduler**：`Request FSM + KVPrefixCache + PageAllocator + ReqPoolAllocator + ExecutionPlan`，是真正的 CPU 侧调度和 KV ownership 核心。
 5. **GPU 执行面**：`token_to_kv_pool + req_to_page + InputBuffers + ForwardContext + ModelRunner`，负责把 C++ plan 物化为 GPU forward 可读的张量和 kernel 调用。
 
-这意味着 PPT 中的架构图必须画出边界，而不是只画功能模块。
+这意味着架构图必须画出边界，而不是只画功能模块。
 
 ## 1. 运行时组件视图
 
@@ -256,7 +256,7 @@ prefill 完成后，`PrefillDone -> Decoding` 会为 decode reserve token slots�
 
 当前代码里对 `DeepseekV4TokenToKVPool` 有明确限制：如果 `enable_kvstore` 开启，会抛 `NotImplementedError`，提示 DeepSeek V4 baseline 不支持 hierarchical cache，需要 `--disable-kvstore`。
 
-因此 PPT 不能把 “L2/host KVStore + L3 storage” 当作 DeepSeek V4 已落地收益去讲。更准确的表达是：
+因此技术判断不能把 “L2/host KVStore + L3 storage” 当作 DeepSeek V4 已落地收益去讲。更准确的表达是：
 
 - TokenSpeed 有通用 hierarchical cache / storage 架构。
 - 但 DeepSeek V4 当前 baseline 路径不支持 hierarchical kvstore。
@@ -304,7 +304,7 @@ TokenSpeed 的优化点要对应这些具体问题：
 - DP rank 无 token 时，是否仍能安全参与 MoE/dense collective？
 - 对 DeepSeek V4 当前路径，哪些通信由显式 `CommManager` 完成，哪些可能由 generic placement compiler 完成？
 
-当前已读代码支持一个重要纠偏：`local-SPMD / placement compiler` 是通用基础设施，存在于 `runtime/models/base/{placement.py, compiler.py, comm_ops.py}`；但 DeepSeek V4 decoder layer 当前读到的是显式 `CommManager` 路径。PPT 中必须区分：
+当前已读代码支持一个重要纠偏：`local-SPMD / placement compiler` 是通用基础设施，存在于 `runtime/models/base/{placement.py, compiler.py, comm_ops.py}`；但 DeepSeek V4 decoder layer 当前读到的是显式 `CommManager` 路径。正式报告中必须区分：
 
 - **已落地实际路径**：DeepSeek V4 forward 中的 `CommManager`、MoE backend、token-aware comm。
 - **通用表达能力**：ModuleSpec placement annotation + compiler 插入 collectives。
@@ -350,7 +350,7 @@ TokenSpeed 的优化点要对应这些具体问题：
 - structured output -> grammar admission / eager grammar overlap exception
 - KV pressure -> retract/loadback
 
-这三张图比一张“大而全”架构图更适合 PPT。首页可以用 Runtime Boundary View，后面分别展开 KV 和 agent workload 优化。
+这三张图比一张“大而全”架构图更适合正式解读。首页可以用 Runtime Boundary View，后面分别展开 KV 和 agent workload 优化。
 
 ## 7. 本目录文档体系
 
@@ -361,13 +361,13 @@ TokenSpeed 的优化点要对应这些具体问题：
 3. `03-agent-kv-management.md`：Scheduler/KV/EventLoop 如何服务 agent 场景。
 4. `04-parallel-strategy-and-placement.md`：并行策略、Mapping、CommManager、placement compiler 和 DeepSeek V4 实际路径。
 5. `05-performance-model-and-poc.md`：把机制转成 counter 和 PoC 胜负线。
-6. `06-code-map-and-open-questions.md`：已读代码、负面结论和未闭合问题。
+6. `06-code-map-and-open-questions.md`：已读代码、判断边界和未闭合问题。
 
-之前的 4+1 草稿可以作为中间材料，但不应再作为 PPT 架构主依据；PPT 应以本文的 runtime boundary view 和请求生命周期图为主。
+之前的 4+1 草稿可以作为中间材料，但不应再作为架构主依据；正式解读应以本文的 runtime boundary view 和请求生命周期图为主。
 
 ## 8. 待补研究缺口
 
-为了让 PPT 真正有深度，接下来还需要补三块代码证据：
+为了让技术解读真正有深度，接下来还需要补三块代码证据：
 
 1. **KVPrefixCache 内部机制**：radix tree node lifetime、lock/ref、evict、insert、match、host/device page accounting。
 2. **MemoryExecutor 与 cache movement**：loadback/writeback/prefetch、stream fence、TP common cache event commit、DeepSeek V4 不支持 hierarchical kvstore 的影响。

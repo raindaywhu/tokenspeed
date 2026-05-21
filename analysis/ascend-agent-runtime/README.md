@@ -27,7 +27,7 @@ TokenSpeed 是一个把请求生命周期、KV page ownership、cache movement�
 
 ## 研究目标
 
-这组文档服务于后续 PPT 和 PoC 方案，重点回答五个问题：
+这组文档服务于 TokenSpeed 架构评审、Ascend 适配决策和 PoC 设计，重点回答五个问题：
 
 1. **TokenSpeed 具体怎么实现？**  
    从进程、C++/Python 边界、CPU/GPU 边界、rank/DP/TP 边界、请求状态和 KV ownership 逐层展开。
@@ -62,11 +62,11 @@ TokenSpeed 是一个把请求生命周期、KV page ownership、cache movement�
    把每个优化点映射到应移动的 counter，说明收益不能线性相加，以及 910C / 950DT PoC 应该怎么判定成败。
 
 6. [代码地图与未闭合问题](06-code-map-and-open-questions.md)  
-   列出当前已经读过的源码入口、已经确认的负面结论，以及下一步还需要继续验证的关键问题。
+   列出当前已经读过的源码入口、已经确认的判断边界，以及下一步还需要继续验证的关键问题。
 
 ## 当前判断边界
 
-为了避免 PPT 过度包装，当前结论保留这些边界：
+为了避免技术判断过度包装，当前结论保留这些边界：
 
 - **不应声称 TokenSpeed 有 tool-call 专用 DDR KV offload。**  
   当前读到的 tool call 主要表现为 chat template / stop token / normal finish path，没有看到 `ToolCallEvent -> offload this request KV to DDR` 的专门策略。
@@ -78,15 +78,15 @@ TokenSpeed 是一个把请求生命周期、KV page ownership、cache movement�
   DeepSeek V4 当前实际路径更像手写模型逻辑 + `CommManager` + 自定义 attention/MoE；placement compiler 是通用基础设施，不能直接等同于 V4 主路径。
 
 - **不应把 MLA kernel 作为最大护城河。**  
-  vLLM 已吸收 TokenSpeed 相关 MLA 算子路径，单 kernel 的护城河下降；仍有价值的是端到端 latent-KV execution、metadata、layout、prefill/decode 切换与 runtime 物化。
+  vLLM 主线已经有 MLA / DeepSeek V4 相关 KV cache spec 与 runtime 支持，单 kernel 的护城河下降；仍有价值的是端到端 latent-KV execution、metadata、layout、prefill/decode 切换与 runtime 物化。
 
-## 如何转成 PPT 叙事
+## 技术解读主线
 
-建议 PPT 不要从“TokenSpeed 有哪些功能”开始，而是从一个问题开始：
+正式解读不应从“TokenSpeed 有哪些功能”开始，而应从一个系统问题开始：
 
 > Agentic MoE serving 的瓶颈不只是算子速度，而是请求生命周期、KV page ownership、短 decode 调度间隙、DP cache skew 和 MoE 通信边界能否被一个系统性 runtime 管住。
 
-对应的章节组织：
+对应的分析主线：
 
 1. **系统架构：TokenSpeed 是五个运行时面的闭环**  
    画出 Main Python / DP Controller / Scheduler Worker / C++ Scheduler / GPU execution plane 的边界。

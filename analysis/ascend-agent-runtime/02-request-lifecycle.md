@@ -2,7 +2,7 @@
 
 > 阅读说明：本文需要和 `01-runtime-architecture.md` 一起读。尤其要区分 Main Python process、DataParallelController process、Scheduler Worker Python process、嵌入式 C++ Scheduler、GPU execution plane；也要区分 C++ Scheduler 持有的是 KV page 的逻辑 ownership，而 GPU `token_to_kv_pool` 持有物理 KV tensor。
 
-本文的目标不是再列一遍 TokenSpeed 的“功能模块”，而是用一个 generate 请求作为线索，把它在系统中如何被接入、调度、占用 KV、进入模型 forward、产生 token、再反向推进 scheduler 的闭环讲清楚。这个图谱会作为后续 PPT 的主骨架：先讲请求生命周期，再把 Scheduler/KV、local-SPMD/Placement、并行策略三个深挖主题挂到真实执行链路上。
+本文的目标不是再列一遍 TokenSpeed 的“功能模块”，而是用一个 generate 请求作为线索，把它在系统中如何被接入、调度、占用 KV、进入模型 forward、产生 token、再反向推进 scheduler 的闭环讲清楚。这个图谱会作为后续技术解读的主骨架：先讲请求生命周期，再把 Scheduler/KV、local-SPMD/Placement、并行策略三个深挖主题挂到真实执行链路上。
 
 ## 0. 核心判断
 
@@ -161,7 +161,7 @@ Python 侧在 `EventLoop._submit_cache_ops()` 把 execution plan 中的 `CacheOp
 - prefill token 从 `forward_op.input_ids` 进入 GPU；decode token 从 `future_input_map` 取；retracted decode 可用 `forward_op.decode_input_ids` 覆盖。
 - 对 CUDA graph padding 区域写 dummy KV slot，避免 replay 污染真实 KV。
 
-这层是 scheduler 与 kernel execution 的接口。如果这里没有讲清楚，PPT 中的“KV ownership”就会变成空话。
+这层是 scheduler 与 kernel execution 的接口。如果这里没有讲清楚，报告中的“KV ownership”就会变成空话。
 
 优化点：
 
@@ -211,7 +211,7 @@ TokenSpeed 有非 overlap 和 overlap 两个 loop。`event_loop_overlap()` 的�
 所以并行策略这一章应分成两层：
 
 - 已落地的实际路径：Mapping + CommManager + DeepSeek V4/MoE backend 如何在请求 forward 时根据真实 token counts 做通信。
-- 通用建模基础设施：Placement compiler 如何把“模块输入/输出分布状态”变成通信 op；它是否覆盖 DeepSeek V4，需要继续验证，不能在 PPT 里直接当成 DeepSeek V4 已用事实。
+- 通用建模基础设施：Placement compiler 如何把“模块输入/输出分布状态”变成通信 op；它是否覆盖 DeepSeek V4，需要继续验证，不能在报告里直接当成 DeepSeek V4 已用事实。
 
 优化点：
 
@@ -307,7 +307,7 @@ TokenSpeed 有非 overlap 和 overlap 两个 loop。`event_loop_overlap()` 的�
 
 已读：`placement.py`、`compiler.py`、`comm_ops.py`，确认存在 Placement type system 和 compiler-inserted CommOps。
 
-关键发现：DeepSeek V4 当前读到的实际 forward path 使用显式 `CommManager`，而不是 `compile_decoder_layer()`。所以 PPT 中不能说 DeepSeek V4 的并行策略已经由 local-SPMD compiler 全自动落地，除非继续找到调用链证据。
+关键发现：DeepSeek V4 当前读到的实际 forward path 使用显式 `CommManager`，而不是 `compile_decoder_layer()`。所以报告中不能说 DeepSeek V4 的并行策略已经由 local-SPMD compiler 全自动落地，除非继续找到调用链证据。
 
 下一步要查：
 
@@ -330,9 +330,9 @@ TokenSpeed 有非 overlap 和 overlap 两个 loop。`event_loop_overlap()` 的�
 
 为什么重要：用户指出“支持 EP 本身大家都差不多”。要证明 TokenSpeed 并行策略特别，必须输出每种 layer family 的 communication plan，而不是列 Mapping/CommManager 名字。
 
-## 4. 这份架构图谱如何重塑 PPT
+## 4. 这份架构图谱如何重塑技术解读
 
-PPT 不应该先讲四个护城河候选，而应该先讲一条请求链路：
+正式报告不应该先讲四个护城河候选，而应该先讲一条请求链路：
 
 1. 一条请求进来后，TokenSpeed 维护四套状态：frontend、scheduler FSM、runtime tensor、output。
 2. Scheduler/KV 是请求生命周期的“资源所有权层”：决定 token 什么时候占 page、什么时候进入 prefix tree、什么时候写回/撤回。
@@ -341,7 +341,7 @@ PPT 不应该先讲四个护城河候选，而应该先讲一条请求链路：
 5. local-SPMD/placement compiler 是“把通信计划系统化表达”的候选机制，但需要区分已在 DeepSeek V4 path 使用的 CommManager 与通用 compiler infrastructure。
 6. MLA/latent-KV execution 是模型-specific backend 实现，介绍实现即可，不应压过 Scheduler/KV 与并行策略。
 
-这能避免上一版 PPT 的问题：看似覆盖很多点，但没有回答“一个请求到底经过哪些状态，TokenSpeed 在哪里做了和 vLLM 不一样的系统决策”。
+这能避免上一版材料的问题：看似覆盖很多点，但没有回答“一个请求到底经过哪些状态，TokenSpeed 在哪里做了和 vLLM 不一样的系统决策”。
 
 ## 5. 后续补强方向
 
@@ -349,4 +349,4 @@ PPT 不应该先讲四个护城河候选，而应该先讲一条请求链路：
 2. 补并行策略通信账本：以 DeepSeek V4 decoder layer 为单位，列 attention/HC/MoE 前后每个 collective、group、token count、条件分支。
 3. 补 local-SPMD 使用范围：查 `compile_decoder_layer()` 调用链，明确它对目标模型是已用、可迁移，还是目前只是一套通用框架。
 4. 补 attention latent cache 轻量实现图：只讲 `ForwardOp -> paged cache block tables -> DeepSeek V4 metadata -> kernel/cache insert/read`。
-5. 把这四份材料重新压成 PPT，每页只保留一个机制图 + 一个结论 + 一个 vLLM 可复制性判断。
+5. 把这四份材料重新整理成正式报告结构，每个小节只保留一个机制图、一个结论和一个 vLLM 可复制性判断。
