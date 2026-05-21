@@ -6,11 +6,11 @@
 
 ## 0. 本次闭环结论
 
-1. `GenerateReqInput` 在核心 runtime 内没有一等的 `tools` 字段。tool schema / tool call 格式主要在 gateway、chat template、tokenizer wrapper 或输出 parser 层处理；进入 `AsyncLLM -> InputProcessor -> Scheduler` 后，本质上是普通 `text/input_ids + sampling_params` 请求。
+1. `GenerateReqInput` 在核心 runtime 内没有一等的 `tools` 字段。tool schema / tool call 格式主要在 SMG gateway、chat template、tokenizer wrapper、tool parser 层处理；进入 `AsyncLLM -> InputProcessor -> Scheduler` 后，本质上是普通 `text/input_ids + sampling_params` 请求。
 2. tool call 不会触发一条独立的 C++ Scheduler 状态，也没有在当前代码路径中看到“tool call 后把该请求 KV 主动搬到 DDR，等待工具返回后用同一 rid 恢复”的逻辑。Scheduler/KV 仍按普通 finish、prefix cache、L2/L3 cache、retraction/writeback 语义工作。
 3. 对 agentic workload 有价值的不是“识别了 tool call”本身，而是：tool schema/系统 prompt/多轮历史能否被 prefix cache 复用；短 decode step 的 CPU/GPU overlap 是否减少 ITL；grammar/structured output 是否在 admission 前被处理，避免坏请求占用 prefill slot。
 4. DeepSeek V4 baseline 当前显式不支持 hierarchical kvstore：`EventLoop` 发现 `DeepseekV4TokenToKVPool` 且 `--enable-kvstore` 时会抛 `NotImplementedError`。因此，不能在 DeepSeek V4 + tool call 场景里声称已经存在 host DDR KV offload/resume 能力。
-5. 旧版“遗留问题”已经分流：请求生命周期、InputProcessor、grammar admission、tool-call 边界在本文闭环；KV allocator/radix/MemoryExecutor 深水区放到 `03-agent-kv-management.md`；local-SPMD/并行策略放到后续专题，不再作为 02 文档的未完成项。
+5. 旧版“遗留问题”已经分流：请求生命周期、InputProcessor、grammar admission、tool-call 解析位置在本文闭环；KV allocator/radix/MemoryExecutor 深水区放到 `03-agent-kv-management.md`；local-SPMD/并行策略放到后续专题，不再作为 02 文档的未完成项。
 
 ## 1. 一条请求的运行时视图
 
@@ -227,23 +227,39 @@ tool-call-parser:
   - deepseek_v4 / kimik2 / hermes 等模型族 parser
 ```
 
-### T0. OpenAI-compatible gateway：tool schema 仍在 runtime 边界外
+### T0. OpenAI-compatible gateway：tool 解析发生在 SMG，而不是 engine
 
 `python/tokenspeed/cli/_argsplit.py` 明确把 `--tool-call-parser` 路由为 gateway-only 参数。`serve_smg.py` 对 DeepSeek V4 会默认给 gateway 补 `--tool-call-parser deepseek_v4`，同时把 `--reasoning-parser deepseek_v31` 同时传给 gateway 和 engine：gateway 用于 post-generation parsing，engine 用于把 JSON grammar 推迟到 reasoning channel 之后。
 
-因此，对“tool call 请求”的第一个结论是：tool-call parser 不在 Scheduler Worker / C++ Scheduler 内。它是 user-facing OpenAI-compatible 层的职责。
+`python/tokenspeed/cli/_proc.py` 进一步说明 `ts serve` 会拉起 `python -m smg launch --worker-urls grpc://...`，也就是 user-facing OpenAI HTTP、chat template、tool parser、reasoning parser 都在 SMG gateway 进程侧。`python/pyproject.toml` pin 的外部包是 `tokenspeed-smg==1.4.1.post20260519`；解包这个 sdist 后可以看到具体实现：
 
-### T1. Chat template / tokenizer：tools 变成 prompt 的一部分
+- `src/smg/router_args.py`：`--tool-call-parser` 的 choices 来自 `get_available_tool_call_parsers()`。
+- `bindings/python/src/lib.rs`：Router builder 调用 `.maybe_tool_call_parser(...)`，同时把可用 parser 列表桥接到 Python。
+- `crates/tool_parser/src/factory.rs`：注册 `json`、`qwen`、`qwen_xml`、`deepseek_v4`、`kimik2`、`minimax_m2` 等 parser，并把 `deepseek-ai/DeepSeek-V4*` 映射到 `deepseek_v4`。
 
-DeepSeek V4 tokenizer wrapper 的 `apply_chat_template(messages, tools=...)` 会在 conversation 前插入 `{"role": "system", "tools": tools}`，再调用模型仓里的 `encode_messages()` 生成 prompt。如果调用链走的是 gateway，它也可能在 engine 之前完成等价的 prompt rendering。
+因此，对“tool call 请求”的第一个结论是：tool-call parser 不在 Scheduler Worker / C++ Scheduler 内。它是 SMG gateway 的职责。
+
+### T0.5. tool 相关解析其实分三段
+
+如果把“tool 解析”拆开看，它不是单个函数：
+
+1. 请求准备阶段：SMG 根据 `messages + tools + tool_choice + --tool-call-parser` 做 chat template/tokenization，并在需要强制 tool call 时生成约束。`model_gateway/src/routers/grpc/regular/stages/chat/preparation.rs` 调用 `tool_parser_factory.registry().generate_tool_constraint(...)`，选择两类约束：支持 native framing 的 parser 走 `structural_tag`；否则 required/function tool_choice 回退成 `json_schema`。
+2. 后端请求构造阶段：SMG 的 TokenSpeed gRPC client 把上一步的 `tool_constraints` 写入 backend sampling params。`crates/grpc_client/src/tokenspeed_scheduler.rs` 的 `build_sampling_params_from_chat()` / `build_constraint_for_chat()` 会把 `(json_schema|structural_tag, value)` 转成 TokenSpeed engine 能理解的 sampling constraint。此时 engine 只看到普通 token ids 和 grammar/structural constraint，不知道原始 tools。
+3. 响应解析阶段：模型输出回来后，SMG 再把文本解析成 OpenAI-compatible `tool_calls`。非流式路径在 `model_gateway/src/routers/grpc/regular/processor.rs`：先分离 reasoning，再在 `tools` 存在且 `tool_choice` 不是 none 时，要么用 `parse_json_schema_response()` 处理 JSON-schema constrained 输出，要么调用 `parse_tool_calls()`，后者从 `tool_parser_factory` 取 parser 并执行 `parser.parse_complete(processed_text)`；如果解析出 tool calls，finish reason 会覆盖为 `tool_calls`。流式路径在 `model_gateway/src/routers/grpc/regular/streaming.rs`，用 parser 的 `parse_incremental()` 逐 chunk 产出 tool-call delta。
+
+另外 `model_gateway/src/routers/parse/handlers.rs` 还暴露了单独的 parse endpoint：它从 `ctx.tool_parser_factory` 取 parser，对传入文本执行 `parse_complete()` 并返回 `remaining_text + tool_calls`。这说明 tool parser 是 gateway 侧独立能力，不依赖 TokenSpeed C++ Scheduler。
+
+### T1. Chat template / tokenizer：tools 变成 prompt 与可选约束
+
+DeepSeek V4 tokenizer wrapper 的 `apply_chat_template(messages, tools=...)` 会在 conversation 前插入 `{"role": "system", "tools": tools}`，再调用模型仓里的 `encode_messages()` 生成 prompt。如果调用链走的是 gateway，它会在 engine 之前完成等价的 prompt rendering，并可能根据 tool_choice 生成 `json_schema` 或 `structural_tag` 约束。
 
 到 engine 入口时，runtime 看到的是：
 
 - `GenerateReqInput.text = rendered_prompt`，或者
 - `GenerateReqInput.input_ids = rendered_token_ids`，以及
-- `sampling_params`，可能包含 `json_schema` / `structural_tag` / stop 参数。
+- `sampling_params`，可能包含由 tool constraint 派生出的 `json_schema` / `structural_tag` / stop 参数。
 
-runtime 并不再持有原始 `tools` 对象。
+runtime 并不再持有原始 `tools` 对象；约束语义已经被降维成 sampling constraint。
 
 ### T2. InputProcessor：tool-call 请求退化为普通 tokenized request
 
@@ -279,6 +295,8 @@ messages:
   - user/assistant continuation ...
 ```
 
+SMG 还支持另一种路径：如果是 gateway 管理的 MCP hosted tools，`model_gateway/src/routers/grpc/regular/responses/non_streaming.rs` / `streaming.rs` 会进入 MCP tool loop，解析 chat response 中的 tool calls、执行 MCP tool、再用 `build_next_request()` 构造下一轮 chat 请求。注意，这仍然是 gateway 发起下一轮 backend request，不是 TokenSpeed engine 内同一个 request pause/resume。
+
 这第二个请求是否快，取决于：
 
 - 前缀渲染是否稳定，能否命中 prefix cache。
@@ -294,7 +312,7 @@ messages:
 - 如果请求带 grammar，grammar termination 可提前 finish。
 - 否则按 EOS、stop strings、max_new_tokens 等结束。
 
-`generation_output_processor` 只负责把 token append 到 `RequestState.output_ids`、产生 `ExtendResult/Finish/UpdateReserve`、流式输出 `BatchTokenIDOut`。真正把字符串解析成 OpenAI-compatible `tool_calls` 字段的是 gateway parser。
+`generation_output_processor` 只负责把 token append 到 `RequestState.output_ids`、产生 `ExtendResult/Finish/UpdateReserve`、流式输出 `BatchTokenIDOut`。真正把字符串解析成 OpenAI-compatible `tool_calls` 字段的是 SMG gateway parser：非流式用 `parse_complete()`，流式用 `parse_incremental()`。
 
 ### T5. tool result 返回后的下一轮请求：主要靠 prefix cache，而不是同一 request resume
 
@@ -317,7 +335,7 @@ sequenceDiagram
   participant O as OutputProcessor
 
   C->>G: messages + tools
-  G->>G: chat template + tool-call parser config
+  G->>G: chat template + parser config + optional tool constraint
   G->>A: GenerateReqInput(text/input_ids, sampling_params)
   A->>E: TokenizedGenerateReqInput
   E->>E: grammar admission / abort / L3 hints
@@ -328,10 +346,16 @@ sequenceDiagram
   M->>O: output tokens
   O->>S: ExtendResult / Finish / Reserve
   O->>G: decoded text/token stream
-  G->>C: assistant tool_call
-  C->>C: execute tool
-  C->>G: new messages with tool result
-  G->>A: next GenerateReqInput
+  G->>G: parse tool calls
+  alt function tool returned to caller
+    G->>C: assistant tool_call
+    C->>C: execute tool
+    C->>G: new messages with tool result
+    G->>A: next GenerateReqInput
+  else MCP hosted tool loop
+    G->>G: execute MCP tool + build_next_request
+    G->>A: next GenerateReqInput
+  end
 ```
 
 ## 4. 生命周期上真正可能产生性能收益的位置
@@ -361,7 +385,8 @@ sequenceDiagram
 |---|---|---|
 | `InputProcessor.tokenize_one_request()` 没有读完 | 已闭环 | 明确 text/input_ids/input_embeds、reasoning JSON schema wrap、`GenerateReqInput` 无 `tools` 字段 |
 | grammar compile queue、TP sync admission、失败/超时策略 | 已闭环 | `GrammarManager` 有 queue、attn TP all-gather consensus、两阶段 timeout、abort mark |
-| tool-call 请求生命周期 | 已闭环 | tool schema/parser 在 gateway 边界；runtime 走普通 request lifecycle；无 tool-call-specific scheduler state |
+| tool-call 请求生命周期 | 已闭环 | tool schema/parser 在 SMG gateway；runtime 走普通 request lifecycle；无 tool-call-specific scheduler state |
+| tool-call parser 具体实现位置 | 已闭环 | `tokenspeed-smg==1.4.1.post20260519` 中的 `crates/tool_parser`、`regular/processor.rs`、`regular/streaming.rs` |
 | tool call 后是否把 KV 搬到 DDR | 已给出负面边界 | 当前代码未见该逻辑；DeepSeek V4 baseline 禁用 `enable_kvstore` |
 | KVPrefixCache/radix/allocator/MemoryExecutor/HostExecutor 细节 | 迁移到 KV 专题 | 这是 `03-agent-kv-management.md` 的主线，不再阻塞 02 生命周期文档 |
 | ForwardContext/attention backend metadata | 本文只保留接口层 | DeepSeek V4 latent-KV metadata 放到后续 backend/kernel 实现解读 |
@@ -369,14 +394,21 @@ sequenceDiagram
 | MoE backend / communication ledger | 迁移到并行策略专题 | 需要按 decoder layer 输出 communication plan，不应放在请求生命周期里展开 |
 | logprob/metrics/detokenizer streaming/backpressure | 生命周期已覆盖基本输出路径 | 量化指标放入性能评估计划 |
 
-## 6. 当前仍缺的外部证据
+## 6. 外部证据闭环与剩余验证项
 
-本文已经能回答“一个请求在 TokenSpeed runtime 内如何执行”，但仍有几类证据不在当前 runtime 代码里：
+本文已经能回答“tool 解析发生在哪里”：发生在 SMG gateway，不发生在 TokenSpeed engine 的 `InputProcessor`、`EventLoop`、C++ Scheduler 或 `generation_output_processor` 内。
 
-1. gateway/SMG 的 tool-call parser 实现细节：当前仓库能看到 CLI 路由和默认 parser 注入，但 parser 如何把模型文本映射成 OpenAI-compatible `tool_calls`，需要读 gateway 代码或外部依赖。
-2. 上层 agent runtime 如何组织 tool result 后的下一轮 prompt：这决定 prefix cache 是否稳定命中，不能只从 engine 内部推断。
-3. DeepSeek V4 hierarchical KVStore 路线：当前 baseline 禁用 kvstore；如果未来支持，需要重新评估 tool wait / long idle / host DDR offload 是否能成为 agent runtime 优化点。
-4. session API 的可用性：虽然 `GenerateReqInput` 有 `session_params`，但当前 `RequestHandler.handle_generate_request()` 对非空 session id 直接返回 invalid session abort；不能把 session 当成已落地的 multi-turn KV reuse 证据。
+已闭环证据：
+
+1. TokenSpeed 仓内证据：`--tool-call-parser` 是 gateway-only 参数；`ts serve` 拉起 `python -m smg launch`；DeepSeek V4 默认 parser 注入只进入 gateway args。
+2. SMG sdist 证据：`tokenspeed-smg==1.4.1.post20260519` 内的 `crates/tool_parser` 注册并实现模型族 parser；`regular/stages/chat/preparation.rs` 在请求准备阶段生成 tool constraint；`crates/grpc_client/src/tokenspeed_scheduler.rs` 把 constraint 转成 TokenSpeed sampling params；`regular/processor.rs` / `regular/streaming.rs` 在响应阶段解析完整文本或流式 chunk，并生成 OpenAI-compatible `tool_calls`。
+3. tool result 之后的下一轮：function tool 默认返回给 client/agent，由上层提交下一轮消息；MCP hosted tool 可以由 SMG gateway 内部 tool loop 执行并构造下一轮 backend request。两者都不是 TokenSpeed engine 内部的同 request resume。
+
+剩余不是“外部证据缺失”，而是性能验证项：
+
+1. 多轮 tool result 请求的 prefix 是否稳定命中，需要构造真实 messages/tools/template 负载测 cached token ratio、second-turn TTFT、p95 ITL。
+2. DeepSeek V4 hierarchical KVStore 当前 baseline 禁用；如果未来支持，需要重新评估 tool wait / long idle / host DDR offload 是否能成为 agent runtime 优化点。
+3. `session_params` 目前不能作为 multi-turn KV reuse 证据，因为 `RequestHandler.handle_generate_request()` 对非空 session id 直接返回 invalid session abort。
 
 ## 7. 对正式技术解读的表达方式
 
@@ -385,6 +417,6 @@ sequenceDiagram
 1. tool schema 进入 prompt，增加 prefill 压力。
 2. TokenSpeed 通过 prefix cache、chunked prefill、grammar admission、abort、overlap loop 降低 agent 多轮/短 decode 的系统成本。
 3. C++ Scheduler/KV ownership 是这些优化能稳定组合的底座。
-4. tool-call parser 本身更像 gateway 兼容性能力，迁移难度不高；真正难复制的是“下一轮带 tool result 请求能否稳定复用 KV，并且在短 decode step 下保持低 p95 ITL”。
+4. tool-call parser 本身更像 gateway 兼容性能力，迁移难度不高；真正难复制的是“gateway 生成的下一轮 backend request 能否稳定复用 KV，并且在短 decode step 下保持低 p95 ITL”。
 
 这个表述能避免把“支持 tool call”误判为护城河，也能把 TokenSpeed 针对 agentic workload 的真实价值落到可验证的 runtime 机制和性能 counter 上。
