@@ -6,15 +6,16 @@
 
 > TokenSpeed 的核心能力到底是如何实现的？这些能力对 DeepSeek V4 / Kimi 类 MoE 与 agentic workload 有什么价值？vLLM / vLLM-Ascend 是不是容易迁移复制？
 
-此前提交的版本过于像英文摘要，缺少系统架构、请求流、KV 生命周期和并行执行协议的展开。这一版重新按“技术解读”组织：先讲 TokenSpeed 是什么样的运行时系统，再用一条请求在系统内的流动把 Scheduler/KV、并行策略、placement compiler 和性能收益挂起来。
+此前提交的版本过于像英文摘要，缺少系统架构、请求流、KV 生命周期和并行执行协议的展开。这一版重新按“技术解读”组织：先讲 TokenSpeed 是什么样的运行时系统，再用一条请求在系统内的流动把 SMG gateway、Scheduler/KV、并行策略、placement compiler 和性能收益挂起来。
 
 ## 一句话结论
 
 TokenSpeed 不应被理解成“带 C++ scheduler 和 MLA kernel 的 vLLM 类 serving 后端”。更准确的理解是：
 
 ```text
-TokenSpeed 是一个把请求生命周期、KV page ownership、cache movement、
-模型层并行拓扑和 GPU forward 物化连接成闭环的推理运行时。
+TokenSpeed + SMG 是一套把 agent-facing gateway、请求生命周期、
+KV page ownership、cache movement、模型层并行拓扑和 GPU forward
+物化连接成闭环的推理运行时系统。
 ```
 
 它最值得研究的地方不是单点功能，而是几个运行时协议是否形成了架构级优势：
@@ -24,6 +25,7 @@ TokenSpeed 是一个把请求生命周期、KV page ownership、cache movement�
 - ModelExecutor 把 C++ 的逻辑 page plan 物化为 GPU 侧 `req_to_page`、`InputBuffers`、`ForwardContext`；
 - Mapping / CommManager / placement compiler 把 attention、dense、MoE 的不同并行域带进模型执行；
 - DeepSeek V4 路径进一步加入 latent/compressed KV、paged cache group、MoE backend 和 token-aware communication。
+- SMG gateway 承担 OpenAI protocol、chat template、tokenizer cache、tool/reasoning parser、MCP tool loop 和 worker routing，为 engine 侧 KV reuse 提供稳定输入和路由前提。
 
 ## 研究目标
 
@@ -64,12 +66,18 @@ TokenSpeed 是一个把请求生命周期、KV page ownership、cache movement�
 6. [代码地图与未闭合问题](06-code-map-and-open-questions.md)  
    列出当前已经读过的源码入口、已经确认的判断边界，以及下一步还需要继续验证的关键问题。
 
+7. [SMG Gateway 技术拆解](07-smg-gateway-runtime.md)
+   单独拆解 SMG 的进程边界、gateway request pipeline、tool/reasoning parser、MCP tool loop、worker routing，以及它和 TokenSpeed engine 的职责切分。
+
 ## 当前判断边界
 
 为了避免技术判断过度包装，当前结论保留这些边界：
 
 - **不应声称 TokenSpeed 有 tool-call 专用 DDR KV offload。**  
   当前读到的 tool call 主要表现为 chat template / stop token / normal finish path，没有看到 `ToolCallEvent -> offload this request KV to DDR` 的专门策略。
+
+- **不应把 SMG gateway 行为写成 TokenSpeed engine 行为。**
+  `--tool-call-parser`、chat template、tokenizer cache、MCP tool loop 和 OpenAI-compatible response formatting 属于 SMG；engine 侧主要接收 tokenized generate request 与 sampling constraints。
 
 - **不应把 DeepSeek V4 hierarchical KVStore 当成已落地收益。**  
   当前分支仍要求 DeepSeek V4 baseline 使用 `--disable-kvstore`，`DeepseekV4TokenToKVPool` 的 offload / reload 路径也明确未实现。
