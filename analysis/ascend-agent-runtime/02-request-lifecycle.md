@@ -1,10 +1,18 @@
-# TokenSpeed 请求上下文执行图谱 v0.1
+# TokenSpeed 请求上下文执行图谱 v0.2
 
 > 阅读说明：本文需要和 `01-runtime-architecture.md` 一起读。尤其要区分 Main Python process、DataParallelController process、Scheduler Worker Python process、嵌入式 C++ Scheduler、GPU execution plane；也要区分 C++ Scheduler 持有的是 KV page 的逻辑 ownership，而 GPU `token_to_kv_pool` 持有物理 KV tensor。
 
-本文的目标不是再列一遍 TokenSpeed 的“功能模块”，而是用一个 generate 请求作为线索，把它在系统中如何被接入、调度、占用 KV、进入模型 forward、产生 token、再反向推进 scheduler 的闭环讲清楚。这个图谱会作为后续技术解读的主骨架：先讲请求生命周期，再把 Scheduler/KV、local-SPMD/Placement、并行策略三个深挖主题挂到真实执行链路上。
+本文的目标不是再列一遍 TokenSpeed 的“功能模块”，而是用一个 generate 请求作为线索，把它在系统中如何被接入、调度、占用 KV、进入模型 forward、产生 token、再反向推进 scheduler 的闭环讲清楚。本版补齐旧版遗留问题，并额外用一条“带 tool call 的消息请求”串流程，明确哪些行为属于 TokenSpeed runtime，哪些属于 OpenAI-compatible gateway 或上层 agent runtime。
 
-## 0. 核心判断
+## 0. 本次闭环结论
+
+1. `GenerateReqInput` 在核心 runtime 内没有一等的 `tools` 字段。tool schema / tool call 格式主要在 gateway、chat template、tokenizer wrapper 或输出 parser 层处理；进入 `AsyncLLM -> InputProcessor -> Scheduler` 后，本质上是普通 `text/input_ids + sampling_params` 请求。
+2. tool call 不会触发一条独立的 C++ Scheduler 状态，也没有在当前代码路径中看到“tool call 后把该请求 KV 主动搬到 DDR，等待工具返回后用同一 rid 恢复”的逻辑。Scheduler/KV 仍按普通 finish、prefix cache、L2/L3 cache、retraction/writeback 语义工作。
+3. 对 agentic workload 有价值的不是“识别了 tool call”本身，而是：tool schema/系统 prompt/多轮历史能否被 prefix cache 复用；短 decode step 的 CPU/GPU overlap 是否减少 ITL；grammar/structured output 是否在 admission 前被处理，避免坏请求占用 prefill slot。
+4. DeepSeek V4 baseline 当前显式不支持 hierarchical kvstore：`EventLoop` 发现 `DeepseekV4TokenToKVPool` 且 `--enable-kvstore` 时会抛 `NotImplementedError`。因此，不能在 DeepSeek V4 + tool call 场景里声称已经存在 host DDR KV offload/resume 能力。
+5. 旧版“遗留问题”已经分流：请求生命周期、InputProcessor、grammar admission、tool-call 边界在本文闭环；KV allocator/radix/MemoryExecutor 深水区放到 `03-agent-kv-management.md`；local-SPMD/并行策略放到后续专题，不再作为 02 文档的未完成项。
+
+## 1. 一条请求的运行时视图
 
 TokenSpeed 的请求上下文不是一个单一对象，而是四类状态的组合：
 
@@ -17,36 +25,46 @@ TokenSpeed 的请求上下文不是一个单一对象，而是四类状态的组
 
 ```mermaid
 flowchart LR
-  A["GenerateReqInput"] --> B["AsyncLLM / InputProcessor<br/>tokenize + ReqState"]
-  B --> C["EngineCoreClient / ZMQ"]
-  C --> D["RequestHandler<br/>TP rank0 recv + TP broadcast"]
-  D --> E["RequestSpec + Output RequestState"]
-  E --> F["EventLoop admission<br/>grammar / abort / PD / L3 query"]
-  F --> G["C++ Scheduler<br/>Request FSM + KV ownership"]
-  G --> H["ExecutionPlan<br/>ForwardOp + CacheOp"]
-  H --> I["MemoryExecutor<br/>prefetch / loadback / writeback"]
-  H --> J["ModelExecutor<br/>req_to_page + InputBuffers + ForwardContext"]
-  J --> K["Model forward<br/>attention / dense / MoE / comm"]
-  K --> L["Sampling + output D2H"]
-  L --> M["Generation OutputProcessor<br/>ExtendResult / Finish / Reserve"]
-  M --> G
-  M --> N["BatchTokenIDOut"]
-  N --> O["AsyncLLM OutputProcessor<br/>inline detokenize + user response"]
+  A["OpenAI/gateway<br/>messages, tools, parser"] --> B["GenerateReqInput<br/>text/input_ids + sampling_params"]
+  B --> C["AsyncLLM / InputProcessor<br/>tokenize + ReqState"]
+  C --> D["EngineCoreClient / ZMQ"]
+  D --> E["RequestHandler<br/>TP rank0 recv + TP broadcast"]
+  E --> F["RequestSpec + Output RequestState"]
+  F --> G["EventLoop admission<br/>grammar / abort / PD / L3 query"]
+  G --> H["C++ Scheduler<br/>Request FSM + KV ownership"]
+  H --> I["ExecutionPlan<br/>ForwardOp + CacheOp"]
+  I --> J["MemoryExecutor<br/>prefetch / loadback / writeback"]
+  I --> K["ModelExecutor<br/>req_to_page + InputBuffers + ForwardContext"]
+  K --> L["Model forward<br/>attention / dense / MoE / comm"]
+  L --> M["Sampling + output D2H"]
+  M --> N["Generation OutputProcessor<br/>ExtendResult / Finish / Reserve"]
+  N --> H
+  N --> O["BatchTokenIDOut"]
+  O --> P["AsyncLLM OutputProcessor<br/>inline detokenize + user response"]
+  P --> Q["gateway parser<br/>reasoning/tool call extraction"]
 ```
 
-## 1. 一条请求在系统中的执行路径
+这里要特别注意：图上的 gateway/parser 是运行时边界外的 OpenAI-compatible 层。TokenSpeed runtime 的 Scheduler/KV 并不感知“这是一个 tool call”，它只感知 token、sampling 参数、grammar、finish reason、KV page ownership。
+
+## 2. 普通 generate 请求的执行路径
 
 ### S1. 前端接入：用户请求变成 tokenized request
 
-代码入口在 `python/tokenspeed/runtime/engine/async_llm.py`。`AsyncLLM` 明确承担 request intake、per-request state、scheduler IPC、output-dispatch loop。单请求路径是：
+代码入口在 `python/tokenspeed/runtime/engine/async_llm.py` 和 `python/tokenspeed/runtime/engine/input_processor.py`。`AsyncLLM` 负责 request intake、per-request state、scheduler IPC、output-dispatch loop；`InputProcessor` 负责 validation、tokenization 和 batch/parallel-sampling fan-out 前的 tokenized object 构造。
 
-- `generate_request()` 先做 request validation、batch normalization，然后调用 `_tokenize_one_request()`。
+单请求路径是：
+
+- `generate_request()` 做 request validation、batch normalization，然后调用 `_tokenize_one_request()`。
+- `InputProcessor.tokenize_one_request()` 读取 `obj.text` / `obj.input_ids` / `obj.input_embeds`，必要时调用 tokenizer encode，把 `sampling_params` 转成 `SamplingParams`，再返回 `TokenizedGenerateReqInput`。
 - `_send_one_request()` 创建前端 `ReqState`，放入 `rid_to_state`，再通过 `engine_core_client.send_to_scheduler.send_pyobj(tokenized_obj)` 送给 scheduler 进程。
 - `_wait_one_response()` 等待该 rid 对应的 collector 产出；如果用户 coroutine 被取消，`finally` 会调用 `abort_request()` 发 `AbortReq`，避免 scheduler 继续烧 slot。
 
-这里的优化点不是模型推理本身，而是控制面语义：取消请求必须能释放 scheduler slot；parallel sampling 会先 warmup common prefix，再复制请求，说明 prefix cache 被当成生成策略的一部分使用。
+本轮闭环后的关键观察：
 
-尚未充分覆盖：`InputProcessor.tokenize_one_request()` 还没有系统读完，特别是 multimodal、batch tokenize、parallel sampling warmup 对 prefill cache 命中率的影响。
+- `GenerateReqInput` 有 `text/input_ids/input_embeds/image/video/audio/sampling_params/session_params`，但没有 `tools` 字段。工具定义必须在进入 runtime 前被渲染进 prompt，或者由模型 tokenizer wrapper 的 `apply_chat_template(..., tools=...)` 处理。
+- `InputProcessor` 会在 `reasoning_parser` 存在且请求带 `json_schema` 时，把普通 JSON grammar 包成 `structural_tag`，让 reasoning token 先生成，再约束最终 response。这个点对 tool-call argument JSON 很重要，但它是 grammar/structured-output 逻辑，不是 scheduler 的 tool-call 特化逻辑。
+- `input_embeds` 与 prefix caching 互斥；这意味着要研究 agent 场景 prefix reuse，必须关注文本/token prompt 路径，而不是 embedding-only 路径。
+- parallel sampling 会先 warmup common prefix，再复制请求，说明 prefix cache 被当成生成策略的一部分使用。
 
 ### S2. IPC 与 TP 同步：rank0 接请求，TP group 同步
 
@@ -54,37 +72,33 @@ flowchart LR
 
 这一点很重要：TokenSpeed 的 scheduler 是每个 rank 本地一份，但它要求 cache plan / forward plan 在 TP ranks 上一致。后面的 `_commit_cache_results()` 也会跨 TP ranks 对 cache event 做 common payload 对齐，确保 scheduler.advance 不会因为某个 rank 的异步 cache op 先完成而破坏镜像状态。
 
-优化点：
+优化含义：
 
-- rank0 接入可以减少多 rank 重复拉取 IPC 的复杂性。
+- rank0 接入减少多 rank 重复拉取 IPC 的复杂性。
 - TP 内广播把 request order 变成确定性输入，降低 C++ scheduler 分布式一致性成本。
-
-潜在代价：
-
-- 当 attention TP size 很大时，控制面广播会进入每轮调度开销。
-- DP attention 下请求负载均衡和 TP 镜像同步叠在一起，后续需要读 DP load balancer 与 mini-lb 逻辑。
+- 代价是 attention TP size 较大时，控制面广播和 cache-event consensus 会进入每轮调度开销。
 
 ### S3. Admission：请求进入 scheduler 前先经过语义闸门
 
-代码入口在 `event_loop.py::_process_new_requests()`。这段比“submit request”复杂得多：
+代码入口在 `event_loop.py::_process_new_requests()` 和 `grammar/grammar_manager.py`。这段比“submit request”复杂得多：
 
 - 接收并分发新请求、控制请求、abort。
 - 对 abort 做 `output_processor.mark_abort()` 和 `grammar_manager.mark_abort()`，覆盖“grammar compile 中请求被取消”的竞态。
-- 按 grammar ready 状态拆分请求；未 ready 的请求先进入 grammar queue，避免无效 grammar 占用 prefill slot。
+- 对带 grammar 的请求先调用 `GrammarManager.process_req_with_grammar()`；如果 grammar 还在编译，先进入 grammar queue，不直接占用 scheduler prefill slot。
+- `GrammarManager.get_ready_grammar_requests()` 每轮扫描 future。attention TP size > 1 时，会用 `all_gather_object()` 做 ready set 交集和 failed set 并集，保证各 TP rank admission 一致。
+- grammar timeout 分两阶段处理：排队等待 executor worker 的时间、worker 真正开始编译后的时间分开算；timeout 结果会记录到 backend cache，避免同一坏 grammar 在并发请求中反复占用编译资源。
 - 如果是 PD decode 实例，设置 `computed_length = input_length`。
 - 注册输出态 `output_processor.register()`。
 - 如果启用 `memory_executor`，用 scheduler 计算 L3 query rolling hashes，并查询 storage hit pages，把 `rolling_hashes` 和 `storage_hit_pages` 写进 `RequestSpec`。
 - 最后才 `scheduler.submit_requests(admitted_specs)`。
 
-这一层说明 TokenSpeed 的 scheduler/KV 设计不是裸 scheduler：请求 admission 已经把 grammar、PD、L3 storage hints、abort races 这些系统语义纳入调度入口。
+这说明 TokenSpeed 的 scheduler/KV 设计不是裸 scheduler：请求 admission 已经把 grammar、PD、L3 storage hints、abort races 这些系统语义纳入调度入口。
 
-优化点：
+对 agentic workload 的直接价值：
 
-- 无效 grammar 不占 prefill token budget。
-- L3 hit pages 在 request submit 前写入 `RequestSpec`，使 C++ scheduler 能决定是否先发 PrefetchOp。
-- abort 在 admission 前后都能落地，减少取消请求继续 decode 到 max_tokens 的风险。
-
-尚未充分覆盖：grammar manager 的 compile queue、TP 同步 admission、失败/超时策略还没完整读；PD bootstrap 信息如何跨 prefill/decode 节点闭环也只读到 EventLoop 入口。
+- tool-call argument 如果使用 JSON schema 约束，坏 grammar 或慢 compile 不会占用 prefill/decode token budget。
+- 用户取消或上层 agent 放弃某个 tool-call 分支时，abort 能在 admission 前后落地，减少无效 decode。
+- TP rank admission 一致性避免“某个 rank 觉得 grammar ready、另一个 rank 还在等”导致的 scheduler 镜像分叉。
 
 ### S4. C++ Scheduler：请求被转换成 FSM 与资源所有权
 
@@ -106,37 +120,19 @@ flowchart LR
 3. 过滤掉 Draining / Prefetching / Retracting / WritingBack，得到可调度 candidates。
 4. 调 `newForwardOperation()` 生成 `FlatForwardOperation`，同时可能生成 LoadBack/WriteBack cache ops。
 
-`newForwardOperation()` 的调度优先级是：
-
-- 正在 chunked prefill 的 `Prefilling`
-- 新来的 `Submitted` / `PrefetchDone`
-- `PrefillDone` / `Decoding`
-- `Retracted`
-
 这里能看出 TokenSpeed 的 scheduler/KV 护城河候选：KV page 不是模型 executor 的附属状态，而是 scheduler FSM 状态转移的一部分；forward op 和 cache op 是同一个 execution plan 的两类操作。
-
-优化点：
-
-- prefix cache 命中减少 prefill tokens。
-- host L2 / storage L3 可以通过 Prefetch / LoadBack / WriteBack 与 forward plan 解耦。
-- retraction 让系统在 device KV 紧张时牺牲长请求驻留，而不是全局停摆。
-- `enable_mixed_prefill_decode` 控制 prefill/decode 是否混排；默认 prefill-first 逻辑避免 decode 被长 prefill 破坏，也能根据 workload 调整。
-- paged cache group 支持 full-history/sliding-window，不只是普通 KV page table，给 DeepSeek V4 这类 latent/cache group 留了表达空间。
-
-尚未充分覆盖：`KVPrefixCache`、radix tree node lock/ref lifetime、Host/Device allocator、HybridPrefixCache、Mamba cache 与 L3 storage 的内部实现还需要单独深挖。
 
 ### S5. Cache op：异步内存动作与 scheduler advance 对齐
 
-Python 侧在 `EventLoop._submit_cache_ops()` 把 execution plan 中的 `CacheOp` 提交给 `MemoryExecutor`，并记录 inflight cache op 数。`_commit_cache_results()` 轮询 `memory_executor.poll_results()`，把 cache event 转成 payload；TP size > 1 时通过 all_gather 找到所有 ranks 都完成的 common cache event，再统一 `scheduler.advance(ec)`。
+Python 侧在 `EventLoop._submit_cache_ops()` 把 execution plan 中的 `CacheOp` 提交给 `MemoryExecutor`，并记录 inflight cache op 数。`_commit_cache_results()` 轮询 `memory_executor.poll_results()`，把 cache event 转成 payload；TP size > 1 时通过 all-gather 找到所有 ranks 都完成的 common cache event，再统一 `scheduler.advance(ec)`。
 
 这个设计解决的是分布式 scheduler 镜像一致性问题：如果每个 TP rank 独立看到 cache op 完成顺序，FSM 可能分叉；TokenSpeed 用 common payload commit 保证所有 TP rank 只推进共同完成的 op。
 
-优化点：
+边界必须写清楚：
 
-- cache op 与 forward op 分离，可以做 async prefetch/loadback/writeback。
-- `_setup_layerwise_loadback()` 暗示 loadback 可做 layerwise consumer 设置；writeback 与 forward 之间通过 stream fence 避免同一 KV slot 被重用后读写乱序。
-
-尚未充分覆盖：`MemoryExecutor`、`HostExecutor`、storage backend、layerwise loadback 的真实 overlap 时序还没有读透，这是 Scheduler/KV 深挖必须补的缺口。
+- Cache op 与 forward op 分离，支持 async prefetch/loadback/writeback，这是 TokenSpeed KV ownership 的核心机制之一。
+- 但在 DeepSeek V4 baseline 路径中，如果 `token_to_kv_pool` 是 `DeepseekV4TokenToKVPool`，`--enable-kvstore` 会直接报 `NotImplementedError`，`memory_executor = None`。所以不能把普通 KVStore/L2/L3 能力无条件套到 DeepSeek V4 + tool call 场景。
+- tool call finish 后是否能靠 host DDR 保留 KV，不是本文代码路径已证明的事实；当前可证明的是普通 prefix cache / scheduler finish / optional writeback 机制。
 
 ### S6. Forward op：C++ plan 变成 GPU 可执行张量
 
@@ -161,16 +157,7 @@ Python 侧在 `EventLoop._submit_cache_ops()` 把 execution plan 中的 `CacheOp
 - prefill token 从 `forward_op.input_ids` 进入 GPU；decode token 从 `future_input_map` 取；retracted decode 可用 `forward_op.decode_input_ids` 覆盖。
 - 对 CUDA graph padding 区域写 dummy KV slot，避免 replay 污染真实 KV。
 
-这层是 scheduler 与 kernel execution 的接口。如果这里没有讲清楚，报告中的“KV ownership”就会变成空话。
-
-优化点：
-
-- 输入 buffer 预分配，减少每轮张量创建。
-- pinned CPU tensor + non_blocking copy 减少 H2D 同步开销。
-- `total_tokens == 0` 的 fully prefix-cached prefill 可以不跑模型，直接产生空输出。
-- CUDA graph wrapper 可以复用静态形状；DP 下用全局 batch/token metadata 选 common padded shape。
-
-尚未充分覆盖：`CudaGraphWrapper` 的捕获策略、attention backend metadata 构建、`cache_loc_kernel` 细节还没有完整串起来。
+这层是 scheduler 与 kernel execution 的接口。如果这里没有讲清楚，“KV ownership”就会变成空话：C++ Scheduler 决定逻辑 page ownership，`ModelExecutor` 再把这个 ownership materialize 成 GPU block table 和 out-cache location。
 
 ### S7. Event loop overlap：CPU commit 与 GPU forward 的错位执行
 
@@ -188,15 +175,7 @@ TokenSpeed 有非 overlap 和 overlap 两个 loop。`event_loop_overlap()` 的�
 
 例外是 eager grammar：如果当前 batch 带 grammar，而上一轮 matcher 还没 advance，必须先 commit prev results，否则 grammar mask 会用旧状态。
 
-优化点：
-
-- decode step 下 CPU/GPU overlap 减少 ITL。
-- DP idle rank 通过 zero-token forward 参与 MoE/dense collectives，避免某些 rank 无请求时 collective hang。
-- Mamba checkpoint 在 overlap decode 前 snapshot，避免上一轮结果还未 commit 时同 slot 状态被下一轮覆盖。
-
-尚未充分覆盖：实际 overlap 收益需要 profiler trace；grammar eager/capturable 两条路径对 p95 的影响还未量化。
-
-### S8. Model forward 与并行策略：真实 DeepSeek V4 path 目前以 CommManager 为主
+### S8. Model forward 与并行策略：DeepSeek V4 path 当前以 CommManager 为主
 
 `ModelRunner.forward()` 把 `ForwardContext`、input ids、positions、out cache loc、input lengths 等传给模型。对 DeepSeek V4，代码路径在 `runtime/models/deepseek_v4.py`：
 
@@ -208,19 +187,10 @@ TokenSpeed 有非 overlap 和 overlap 两个 loop。`event_loop_overlap()` 的�
 
 这里必须纠偏：`local-SPMD / placement compiler` 确实存在于 `runtime/models/base/{placement.py,compiler.py,comm_ops.py}`，它能基于 `ModuleSpec` 的 input/output placement 自动插入 AllGather、ReduceScatter、AllReduce、ResidualAllGather、ResidualSlice、FusedReduceNorm 等 `CommOp`。但在当前读到的 DeepSeek V4 实际执行链中，decoder layer 仍是显式 `CommManager` 接线，而不是通过 `compile_decoder_layer()` 生成 `CompiledDecoderLayer`。
 
-所以并行策略这一章应分成两层：
+所以并行策略章节应分成两层：
 
 - 已落地的实际路径：Mapping + CommManager + DeepSeek V4/MoE backend 如何在请求 forward 时根据真实 token counts 做通信。
 - 通用建模基础设施：Placement compiler 如何把“模块输入/输出分布状态”变成通信 op；它是否覆盖 DeepSeek V4，需要继续验证，不能在报告里直接当成 DeepSeek V4 已用事实。
-
-优化点：
-
-- attention / dense / MoE mapping 分开建模，`Mapping` 支持 attn TP/CP/DP、dense TP/DP、MoE TP/EP/DP。
-- `CommManager` 的 token-aware all_gather / reduce_scatter 使用 `ForwardContext.global_num_tokens` 或当前 `input_num_tokens` 计算每个 rank 的真实 token count，不按最大 batch 盲目通信。
-- 如果 attention TP size 与 MoE TP+EP size 相同，可以走 all-reduce 模式；否则走 token all-gather + reduce-scatter，这解释了“并行策略特别在哪里”不是支持 EP，而是不同 layer family 的通信边界可切换。
-- DP idle forward 让 MoE collectives 在不均衡 DP 请求分配下仍能正确推进。
-
-尚未充分覆盖：普通 `MoELayer` 内部 backend selector、DeepEP dispatcher、token permutation/combine、expert location / EPLB、MegaMoE backend 的完整路径还没读完。并行策略的性能收益必须落到这些 token movement 和 collective 计数上。
 
 ### S9. Sampling、输出处理与 scheduler 反向推进
 
@@ -232,28 +202,150 @@ TokenSpeed 有非 overlap 和 overlap 两个 loop。`event_loop_overlap()` 的�
 - 如果请求 finished，发 `Finish`，触发 C++ `FinishEvent`，释放/写回 KV。
 - 如果普通 decode 还没 finished，发 `UpdateReserveNumTokens`，让下一次 schedule decode 时按实际 accept length 预留 KV slots。
 
-输出侧用 `BatchTokenIDOut` 直接发回 AsyncLLM 的 tokenizer IPC socket。AsyncLLM 的 `OutputProcessor.handle_batch_output()` 做 inline detokenizer、collector put、event set，用户 coroutine 被唤醒并 yield response。
+finish 判定包含几类来源：
 
-优化点：
+- abort。
+- grammar termination。
+- `max_new_tokens`。
+- stop token ids、HF EOS、tokenizer `eos_token_id`。
+- tokenizer 的 `additional_stop_token_ids`。`hf_transformers_utils.attach_additional_stop_token_ids()` 会把 `<|eom_id|>` 加入额外 stop token 集合，用于 Llama 3 tool-use 这类模型。
+- stop strings。
 
-- scheduler 的下一轮 reserve token 数来自本轮实际 output length，spec decode 下能避免过度预留。
-- output D2H 与 forward stream 分离，commit 可与下一轮 forward overlap。
-- inline detokenizer 减少独立 detokenizer 进程路径，但也把部分 CPU work 放回主进程。
+输出侧用 `BatchTokenIDOut` 直接发回 AsyncLLM 的 tokenizer IPC socket。AsyncLLM 的 `OutputProcessor.handle_batch_output()` 做 inline detokenizer、collector put、event set，用户 coroutine 被唤醒并 yield response。tool call parser 如果存在，属于 gateway/SMG 的后处理，不在 C++ Scheduler 或 `generation_output_processor` 里。
 
-尚未充分覆盖：logprob、metrics、detokenizer streaming interval 对 p95 latency 的影响没有量化；多 batch streaming collector 的 backpressure 还没读。
+## 3. 带 tool call 消息的一条请求如何穿过 TokenSpeed
 
-## 2. 这条链路上真正可能产生性能收益的位置
+下面用一个典型 agent 请求来串流程：
+
+```text
+messages:
+  - system: 你是一个可以调用工具的助手
+  - user: 帮我查北京明天的天气
+tools:
+  - get_weather(city: string, date: string)
+tool-call-parser:
+  - deepseek_v4 / kimik2 / hermes 等模型族 parser
+```
+
+### T0. OpenAI-compatible gateway：tool schema 仍在 runtime 边界外
+
+`python/tokenspeed/cli/_argsplit.py` 明确把 `--tool-call-parser` 路由为 gateway-only 参数。`serve_smg.py` 对 DeepSeek V4 会默认给 gateway 补 `--tool-call-parser deepseek_v4`，同时把 `--reasoning-parser deepseek_v31` 同时传给 gateway 和 engine：gateway 用于 post-generation parsing，engine 用于把 JSON grammar 推迟到 reasoning channel 之后。
+
+因此，对“tool call 请求”的第一个结论是：tool-call parser 不在 Scheduler Worker / C++ Scheduler 内。它是 user-facing OpenAI-compatible 层的职责。
+
+### T1. Chat template / tokenizer：tools 变成 prompt 的一部分
+
+DeepSeek V4 tokenizer wrapper 的 `apply_chat_template(messages, tools=...)` 会在 conversation 前插入 `{"role": "system", "tools": tools}`，再调用模型仓里的 `encode_messages()` 生成 prompt。如果调用链走的是 gateway，它也可能在 engine 之前完成等价的 prompt rendering。
+
+到 engine 入口时，runtime 看到的是：
+
+- `GenerateReqInput.text = rendered_prompt`，或者
+- `GenerateReqInput.input_ids = rendered_token_ids`，以及
+- `sampling_params`，可能包含 `json_schema` / `structural_tag` / stop 参数。
+
+runtime 并不再持有原始 `tools` 对象。
+
+### T2. InputProcessor：tool-call 请求退化为普通 tokenized request
+
+`InputProcessor.tokenize_one_request()` 不解析 tools，也不构造 tool-call state。它只做：
+
+- text/input ids/input embeds 选择。
+- context length 与 `max_new_tokens` 校验。
+- 如果有 `reasoning_parser + json_schema`，把 `json_schema` 包成 `structural_tag`。
+- 构造 `SamplingParams`。
+- 返回 `TokenizedGenerateReqInput`。
+
+这一步对性能的影响主要来自 prompt tokens 增长：tool schema 越长，prefill 越重；多轮 agent 如果每轮重复完整 schema，必须依赖 prefix cache 才能把这部分成本摊掉。
+
+### T3. Admission / Scheduler / KV：没有 tool-call 特化状态
+
+进入 `RequestHandler` 和 `EventLoop` 后，这条请求和普通 chat completion 一样：
+
+- TP rank0 接收，TP group broadcast。
+- 如果有 grammar，先走 grammar admission；没有则直接进入 scheduler。
+- C++ Scheduler 做 prefix match、chunked prefill、decode reserve、finish/retract/writeback。
+- ModelExecutor 将 `ForwardOp` materialize 成 GPU buffer 与 KV page table。
+
+这里没有看到 `ToolCallStarted` / `ToolCallPause` / `ToolResultResume` 之类状态；也没有看到“模型输出 tool call 后立即把该 request 的 live KV 写到 DDR 等工具返回”的路径。
+
+如果上层 agent 执行工具需要几十毫秒到几秒，TokenSpeed runtime 更像是完成了第一段 generation，然后结束该请求。工具结果回来后，上层会发第二个请求：
+
+```text
+messages:
+  - system + tools
+  - user
+  - assistant: tool_call(get_weather, ...)
+  - tool: 北京明天天气...
+  - user/assistant continuation ...
+```
+
+这第二个请求是否快，取决于：
+
+- 前缀渲染是否稳定，能否命中 prefix cache。
+- 第一轮的 prefix / generated tokens 是否在 scheduler cache tree 中仍可复用。
+- device KV 压力下是否发生 eviction/retraction/writeback。
+- 对 DeepSeek V4，不能假设 kvstore offload 已经可用，因为当前 baseline 禁止 `enable_kvstore`。
+
+### T4. Output / parser：生成 tool call 格式，再由 gateway 解析
+
+模型生成 tool-call 格式的 token 后，runtime 仍按普通 finish 判定推进：
+
+- 如果模型输出 `<|eom_id|>`，tokenizer 的 `additional_stop_token_ids` 可让 `RequestState.check_finished()` 触发 `FINISH_MATCHED_TOKEN`。
+- 如果请求带 grammar，grammar termination 可提前 finish。
+- 否则按 EOS、stop strings、max_new_tokens 等结束。
+
+`generation_output_processor` 只负责把 token append 到 `RequestState.output_ids`、产生 `ExtendResult/Finish/UpdateReserve`、流式输出 `BatchTokenIDOut`。真正把字符串解析成 OpenAI-compatible `tool_calls` 字段的是 gateway parser。
+
+### T5. tool result 返回后的下一轮请求：主要靠 prefix cache，而不是同一 request resume
+
+从当前代码证据看，tool result 返回后更像“新请求 + 更长 prompt”，不是“旧请求 resume”。这对 agent runtime 优化判断很关键：
+
+- 如果 report 说 TokenSpeed 针对 agent 的优势是“tool call pause 后 KV 放 DDR”，当前代码证据不足。
+- 更稳妥的表述是：TokenSpeed 的 Scheduler/KV ownership 为多轮 agent prompt reuse 提供了系统基础；收益来自 prefix cache、chunked prefill、finish/writeback/retraction、overlap loop，而不是 tool-call 对象本身。
+- 对长上下文、多轮 prefix、短 decode step 的 agent workload，应重点测“第二轮带 tool result 请求”的 cached token ratio、TTFT、p95 ITL，而不是只测单轮 tool-call parser 是否正确。
+
+整体流程可以画成：
+
+```mermaid
+sequenceDiagram
+  participant C as Client/Agent
+  participant G as Gateway/SMG
+  participant A as AsyncLLM/InputProcessor
+  participant E as EventLoop
+  participant S as C++ Scheduler
+  participant M as ModelExecutor/GPU
+  participant O as OutputProcessor
+
+  C->>G: messages + tools
+  G->>G: chat template + tool-call parser config
+  G->>A: GenerateReqInput(text/input_ids, sampling_params)
+  A->>E: TokenizedGenerateReqInput
+  E->>E: grammar admission / abort / L3 hints
+  E->>S: submit RequestSpec
+  S->>S: prefix match + KV ownership FSM
+  S->>E: ExecutionPlan(ForwardOp, CacheOp)
+  E->>M: req_to_page + input buffers + forward
+  M->>O: output tokens
+  O->>S: ExtendResult / Finish / Reserve
+  O->>G: decoded text/token stream
+  G->>C: assistant tool_call
+  C->>C: execute tool
+  C->>G: new messages with tool result
+  G->>A: next GenerateReqInput
+```
+
+## 4. 生命周期上真正可能产生性能收益的位置
 
 | 位置 | 性能收益来源 | 可能移动的指标 | 迁移到 vLLM/vLLM-Ascend 难度初判 |
 |---|---|---|---|
-| Admission + abort + grammar | 无效请求不占 scheduler slot；取消请求及时释放 slot；grammar compile 不阻塞正常请求 | waiting queue、active req、wasted decode steps、p95 queue time | 中等，偏控制面改造 |
-| Scheduler FSM + KV ownership | prefix hit、chunked prefill、decode reserve、retraction、finish writeback 统一进 FSM | cached token ratio、KV page active/cached、retraction 次数、TTFT/ITL | 高，属于架构级复制 |
-| Cache op 与 forward op 分离 | L2/L3 prefetch/loadback/writeback 可与 forward 解耦，TP ranks 一致 commit | loadback stall、writeback stall、device KV pressure、GPU gap | 高，需要 scheduler/cache executor 联动 |
+| Tool schema / prompt rendering | 稳定 system/tools prefix 可被 prefix cache 复用；减少每轮 agent prefill 重算 | cached token ratio、second-turn TTFT、prefill tokens/request | 中等。配置可复制，但稳定渲染和 cache lifecycle 要联动 |
+| Admission + abort + grammar | 无效 grammar 不占 scheduler slot；取消请求及时释放 slot；grammar compile 不阻塞正常请求 | grammar queue time、compile timeout、wasted decode steps、p95 queue time | 中等，偏控制面改造 |
+| Scheduler FSM + KV ownership | prefix hit、chunked prefill、decode reserve、retraction、finish writeback 统一进 FSM | KV page active/cached、retraction 次数、TTFT/ITL | 高，属于架构级复制 |
+| Cache op 与 forward op 分离 | L2/L3 prefetch/loadback/writeback 可与 forward 解耦，TP ranks 一致 commit | loadback stall、writeback stall、device KV pressure、GPU gap | 高；但 DeepSeek V4 baseline 当前不可直接声称已用 |
 | Overlap event loop | 当前 GPU forward 与上一轮 CPU postprocess 重叠 | GPU idle gap、p95 ITL、scheduler iteration time | 中高，vLLM 有异步机制但语义不等价 |
-| DP idle forward + token metadata | DP rank 无请求也参与 collective；MoE/dense collective 不 hang；选择 common graph shape | collective hang/stall、DP imbalance、tokens/rank variance | 中高，取决于 vLLM-Ascend DP/MoE runtime |
+| Output stop / parser 边界 | `<|eom_id|>` 等额外 stop token 可缩短无效尾部；parser 不拖入 scheduler | generated tail tokens、finish_reason 分布、streaming latency | 低到中。parser 可迁移，stop/tokenizer 细节要按模型族处理 |
+| DP idle forward + token metadata | DP rank 无请求也参与 collective；MoE/dense collective 不 hang；选择 common graph shape | collective stall、DP imbalance、tokens/rank variance | 中高，取决于 vLLM-Ascend DP/MoE runtime |
 | Mapping + token-aware comm | attention/dense/MoE group 不强制一致；token all-gather/reduce-scatter 按真实 token counts | collective bytes、all-gather/reduce-scatter time、MoE all-to-all pressure | 高，需模型层/通信层协同 |
-| InputBuffers + CUDA graph | 预分配张量、dummy slot padding、graph replay | per-step CPU overhead、H2D copy、decode latency variance | 中等，后端相关 |
-| DeepSeek V4 latent/cache execution | compressed cache slot mapping、paged cache group、indexer/topk/cache insert | attention kernel time、KV bytes/token、decode memory bandwidth | 中等到高；MLA kernel 本身 vLLM 已吸收，端到端 cache layout 仍需看 |
 
 粗略性能模型不能简单相加。建议把收益拆成三类：
 
@@ -261,92 +353,38 @@ TokenSpeed 有非 overlap 和 overlap 两个 loop。`event_loop_overlap()` 的�
 - 缩短关键路径：overlap loop、input buffer、CUDA graph、inline detokenize/streaming。
 - 改变通信量或通信同步方式：token-aware TP/EP/DP collective、idle forward、MoE dispatch/combine。
 
-对 910C + 950DT，最需要验证的是第三类，因为不同并行策略在 Ascend collective/all-to-all 上的瓶颈可能和 NVIDIA 不同。
+对 910C + 950DT，最需要验证的是第三类，因为不同并行策略在 Ascend collective/all-to-all 上的瓶颈可能和 NVIDIA 不同。对 tool-call agent workload，最需要验证的是第一类和第二类：第二轮/第三轮请求的 prefix hit 是否足够高，以及短 decode step 下 CPU/GPU gap 是否被 overlap loop 压下来。
 
-## 3. 当前遗漏：下一轮必须补齐的执行链路空洞
+## 5. 旧版遗留问题闭环表
 
-### A. 请求入口和负载均衡还没闭环
+| 旧版遗留问题 | 本版处理结果 | 备注 |
+|---|---|---|
+| `InputProcessor.tokenize_one_request()` 没有读完 | 已闭环 | 明确 text/input_ids/input_embeds、reasoning JSON schema wrap、`GenerateReqInput` 无 `tools` 字段 |
+| grammar compile queue、TP sync admission、失败/超时策略 | 已闭环 | `GrammarManager` 有 queue、attn TP all-gather consensus、两阶段 timeout、abort mark |
+| tool-call 请求生命周期 | 已闭环 | tool schema/parser 在 gateway 边界；runtime 走普通 request lifecycle；无 tool-call-specific scheduler state |
+| tool call 后是否把 KV 搬到 DDR | 已给出负面边界 | 当前代码未见该逻辑；DeepSeek V4 baseline 禁用 `enable_kvstore` |
+| KVPrefixCache/radix/allocator/MemoryExecutor/HostExecutor 细节 | 迁移到 KV 专题 | 这是 `03-agent-kv-management.md` 的主线，不再阻塞 02 生命周期文档 |
+| ForwardContext/attention backend metadata | 本文只保留接口层 | DeepSeek V4 latent-KV metadata 放到后续 backend/kernel 实现解读 |
+| local-SPMD / placement compiler 覆盖范围 | 迁移到并行/compiler 专题 | 本文只保留“DeepSeek V4 实际 path 目前以 CommManager 为主”的纠偏 |
+| MoE backend / communication ledger | 迁移到并行策略专题 | 需要按 decoder layer 输出 communication plan，不应放在请求生命周期里展开 |
+| logprob/metrics/detokenizer streaming/backpressure | 生命周期已覆盖基本输出路径 | 量化指标放入性能评估计划 |
 
-已读：`AsyncLLM`、`RequestHandler`、`EventLoop._process_new_requests()`。
+## 6. 当前仍缺的外部证据
 
-未读透：
+本文已经能回答“一个请求在 TokenSpeed runtime 内如何执行”，但仍有几类证据不在当前 runtime 代码里：
 
-- `InputProcessor` tokenization/multimodal/batch tokenize。
-- `EngineCoreClient` socket 建立、scheduler subprocess lifecycle。
-- DP load balancer 如何选择 rank，`GetLoadReqInput/GetLoadReqOutput` 如何被上层使用。
+1. gateway/SMG 的 tool-call parser 实现细节：当前仓库能看到 CLI 路由和默认 parser 注入，但 parser 如何把模型文本映射成 OpenAI-compatible `tool_calls`，需要读 gateway 代码或外部依赖。
+2. 上层 agent runtime 如何组织 tool result 后的下一轮 prompt：这决定 prefix cache 是否稳定命中，不能只从 engine 内部推断。
+3. DeepSeek V4 hierarchical KVStore 路线：当前 baseline 禁用 kvstore；如果未来支持，需要重新评估 tool wait / long idle / host DDR offload 是否能成为 agent runtime 优化点。
+4. session API 的可用性：虽然 `GenerateReqInput` 有 `session_params`，但当前 `RequestHandler.handle_generate_request()` 对非空 session id 直接返回 invalid session abort；不能把 session 当成已落地的 multi-turn KV reuse 证据。
 
-为什么重要：如果报告要回答 agentic workload p95 latency，只看 GPU forward 不够，请求入口排队和 DP routing 会直接影响 p95。
+## 7. 对正式技术解读的表达方式
 
-### B. KV ownership 的底层 allocator/cache tree 还没读完
+正式报告不应该把 tool call 讲成一个 isolated feature，而应该把它放回请求生命周期：
 
-已读：C++ Request FSM、schedule prefill/decode/retract、LoadBack/WriteBack/Prefetch 生成、Python cache event commit。
+1. tool schema 进入 prompt，增加 prefill 压力。
+2. TokenSpeed 通过 prefix cache、chunked prefill、grammar admission、abort、overlap loop 降低 agent 多轮/短 decode 的系统成本。
+3. C++ Scheduler/KV ownership 是这些优化能稳定组合的底座。
+4. tool-call parser 本身更像 gateway 兼容性能力，迁移难度不高；真正难复制的是“下一轮带 tool result 请求能否稳定复用 KV，并且在短 decode step 下保持低 p95 ITL”。
 
-未读透：
-
-- `KVPrefixCache` radix tree：device/host node ref、lock、eviction、Touch/LRU。
-- `PageAllocator`、`LocalKVAllocator`、`OwnedPages` 生命周期。
-- `MemoryExecutor`/`HostExecutor`：host/device/storage copy 的 stream、layerwise loadback、prefetch 的实际异步行为。
-- L3 storage backend 和 rolling hash 的一致性边界。
-
-为什么重要：Scheduler/KV 是否构成护城河，关键证据就在“页面所有权和异步搬运是否可安全复用”，而不是 API 层说支持 prefix cache。
-
-### C. ForwardContext 到 attention backend 的 metadata 还没完整串起来
-
-已读：`ModelExecutor`、`InputBuffers`、`RuntimeStates`、DeepSeek V4 部分 attention/MoE 入口。
-
-未读透：
-
-- `create_attn_components()` 如何选择 DeepSeek V4 token_to_kv_pool / attention backend。
-- `DeepseekV4TokenToKVPool` 的 paged cache group spec 如何落到 scheduler `PagedCacheGroupConfig`。
-- `deepseek_v4.py` backend metadata：compressed slot mapping、indexer cache、CSA/HCA cache table、prefill/decode metadata。
-- `deepseek_v4_ops.py` 与 `tokenspeed-kernel` 的边界。
-
-为什么重要：MLA/latent-KV 权重虽然在报告中应降低，但作为 DeepSeek V4 请求链的一段实现仍要讲清楚，否则 KV page 与 latent cache group 如何进入 kernel 会断。
-
-### D. local-SPMD / placement compiler 的实际覆盖范围还没验证
-
-已读：`placement.py`、`compiler.py`、`comm_ops.py`，确认存在 Placement type system 和 compiler-inserted CommOps。
-
-关键发现：DeepSeek V4 当前读到的实际 forward path 使用显式 `CommManager`，而不是 `compile_decoder_layer()`。所以报告中不能说 DeepSeek V4 的并行策略已经由 local-SPMD compiler 全自动落地，除非继续找到调用链证据。
-
-下一步要查：
-
-- 哪些模型实际调用 `compile_decoder_layer()`。
-- DeepSeek V4 是否计划迁移到 ModuleSpec，还是保留手写 CommManager。
-- Placement compiler 与旧 CommManager 的功能重叠/差异：尤其 residual placement、fused reduce norm、token-aware scattered counts。
-
-为什么重要：这决定“local-SPMD 是护城河”还是“有潜力但未完全落到目标模型路径”。
-
-### E. 并行策略的收益还没落到通信账本
-
-已读：`Mapping`、`CommManager`、DeepSeek V4 decoder/MoE 前后通信、部分 MoE backend 入口。
-
-未读透：
-
-- `MoELayer` 的 dispatch/combine、TopK、backend selector。
-- DeepEP dispatcher、local compute、expert location、EPLB。
-- dense TP / attention TP / MoE TP+EP 不同组合下每层 collective 序列。
-- `ctx.global_num_tokens` 在 DP + MoE 下如何影响 token-aware collective bytes。
-
-为什么重要：用户指出“支持 EP 本身大家都差不多”。要证明 TokenSpeed 并行策略特别，必须输出每种 layer family 的 communication plan，而不是列 Mapping/CommManager 名字。
-
-## 4. 这份架构图谱如何重塑技术解读
-
-正式报告不应该先讲四个护城河候选，而应该先讲一条请求链路：
-
-1. 一条请求进来后，TokenSpeed 维护四套状态：frontend、scheduler FSM、runtime tensor、output。
-2. Scheduler/KV 是请求生命周期的“资源所有权层”：决定 token 什么时候占 page、什么时候进入 prefix tree、什么时候写回/撤回。
-3. Forward execution 是“计划落地层”：C++ `ForwardOp` 被转换成 `req_to_page/InputBuffers/ForwardContext`，再交给 attention/MoE/comm。
-4. 并行策略是“模型 forward 中的通信计划层”：在真实 token counts 和 layer family group 之间选择 all-reduce 或 token all-gather/reduce-scatter。
-5. local-SPMD/placement compiler 是“把通信计划系统化表达”的候选机制，但需要区分已在 DeepSeek V4 path 使用的 CommManager 与通用 compiler infrastructure。
-6. MLA/latent-KV execution 是模型-specific backend 实现，介绍实现即可，不应压过 Scheduler/KV 与并行策略。
-
-这能避免上一版材料的问题：看似覆盖很多点，但没有回答“一个请求到底经过哪些状态，TokenSpeed 在哪里做了和 vLLM 不一样的系统决策”。
-
-## 5. 后续补强方向
-
-1. 补 KV ownership 底层证据：读 `KVPrefixCache`、allocator、MemoryExecutor/HostExecutor，画 page ownership/state transition 图。
-2. 补并行策略通信账本：以 DeepSeek V4 decoder layer 为单位，列 attention/HC/MoE 前后每个 collective、group、token count、条件分支。
-3. 补 local-SPMD 使用范围：查 `compile_decoder_layer()` 调用链，明确它对目标模型是已用、可迁移，还是目前只是一套通用框架。
-4. 补 attention latent cache 轻量实现图：只讲 `ForwardOp -> paged cache block tables -> DeepSeek V4 metadata -> kernel/cache insert/read`。
-5. 把这四份材料重新整理成正式报告结构，每个小节只保留一个机制图、一个结论和一个 vLLM 可复制性判断。
+这个表述能避免把“支持 tool call”误判为护城河，也能把 TokenSpeed 针对 agentic workload 的真实价值落到可验证的 runtime 机制和性能 counter 上。
