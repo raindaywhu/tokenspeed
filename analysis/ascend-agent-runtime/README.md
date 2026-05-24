@@ -46,6 +46,49 @@ KV page ownership、cache movement、模型层并行拓扑和 GPU forward
 5. **vLLM / vLLM-Ascend 是否容易复制？**  
    每个机制都要区分：config 可复制、model patch 可复制、runtime protocol 可复制，还是需要架构级重构。
 
+## Current Goal: From Architecture Description to Competitiveness Validation
+
+The current purpose of this analysis is to answer a specific question:
+
+Does TokenSpeed have verifiable advantages over vLLM and TensorRT-LLM for agent workloads?
+
+This document set should not assume the answer is yes. Instead, it should separate:
+
+- verified advantages
+- potential advantages
+- architecture differences
+- parity areas
+- disadvantages
+- unknowns requiring benchmark evidence
+
+The analysis should avoid converting design intent into performance conclusions.
+
+In particular, the following claims must remain evidence-bounded:
+
+- SMG gateway behavior is not the same as TokenSpeed engine behavior.
+- Tool-call parsing is primarily a serving-layer or gateway-layer responsibility.
+- Tool calls should not be treated as engine-native request states unless the code path proves it.
+- Tool wait should not be described as automatic DDR KV offload and same-request resume unless traces prove it.
+- DeepSeek V4 hierarchical KVStore should not be described as a proven advantage unless the target model path supports it.
+- C++ Scheduler should be treated as a potential CPU-control-plane advantage, not a verified advantage.
+- vLLM and TensorRT-LLM should be treated as strong baselines, not weak baselines.
+
+For the competitiveness validation framework, see:
+
+- [TokenSpeed Competitiveness Validation Framework](08-competitiveness-validation-framework.md)
+
+That document defines:
+
+- what counts as an advantage
+- a TokenSpeed / vLLM / TensorRT-LLM decision matrix
+- a claim ledger for possible TokenSpeed advantages
+- a minimal agent benchmark protocol
+- safe conclusion templates for reports and PPTs
+
+Current recommended positioning:
+
+TokenSpeed is a high-potential inference runtime whose possible advantage lies in scheduler, KV lifecycle, and runtime integration for agent workloads. Current evidence supports further evaluation, but not a final superiority claim over vLLM or TensorRT-LLM.
+
 ## 阅读顺序
 
 1. [TokenSpeed Runtime 架构纠偏](01-runtime-architecture.md)  
@@ -68,6 +111,9 @@ KV page ownership、cache movement、模型层并行拓扑和 GPU forward
 
 7. [SMG Gateway 技术拆解](07-smg-gateway-runtime.md)
    单独拆解 SMG 的进程边界、gateway request pipeline、tool/reasoning parser、MCP tool loop、worker routing，以及它和 TokenSpeed engine 的职责切分。
+
+8. [TokenSpeed 竞争力验证框架](08-competitiveness-validation-framework.md)
+   定义什么才算 verified advantage / potential advantage / parity / unknown，并给出 agent workload 的最小验证协议、claim ledger 和安全结论模板。
 
 ## 当前事实边界
 

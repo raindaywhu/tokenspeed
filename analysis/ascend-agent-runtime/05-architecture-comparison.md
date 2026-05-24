@@ -24,6 +24,19 @@
 
 本文不判断 TokenSpeed 是否明显更强，只列出架构差异、实现路径、边界条件和仍需验证的问题。
 
+## Note on Competitiveness Claims
+
+This comparison should be read together with [TokenSpeed Competitiveness Validation Framework](08-competitiveness-validation-framework.md).
+
+The purpose of this comparison is not to claim that TokenSpeed is already superior to vLLM or TensorRT-LLM. The purpose is to identify which architectural differences could become real advantages if they are supported by source-level evidence, profiling counters, and reproducible benchmark results.
+
+In this document:
+
+- "potential advantage" means architecture suggests a possible benefit, but benchmark evidence is still missing.
+- "verified advantage" should only be used when the benefit is proven under controlled workloads.
+- protocol-layer features such as tool-call parsing should not be treated as TokenSpeed engine advantages unless the engine itself observes and acts on that state.
+- SMG gateway capabilities must be distinguished from TokenSpeed engine capabilities.
+
 ## 0. 证据边界
 
 | 框架 | 本文证据来源 | 本文不做的事 |
