@@ -2,7 +2,7 @@
 
 更新时间：2026-05-21
 
-本目录整理的是一组面向 **Ascend 910C + 950DT 适配决策** 的 TokenSpeed 源码分析文档。它不是官方使用手册，也不是功能清单，而是回答一个更尖锐的问题：
+本目录整理的是一组面向 **TokenSpeed 架构评估与 Ascend 910C + 950DT 适配判断** 的源码分析文档。它不是官方使用手册，也不是功能清单，而是回答一个更尖锐的问题：
 
 > TokenSpeed 的核心能力到底是如何实现的？这些能力对 DeepSeek V4 / Kimi 类 MoE 与 agentic workload 有什么价值？vLLM / vLLM-Ascend 是不是容易迁移复制？
 
@@ -29,7 +29,7 @@ KV page ownership、cache movement、模型层并行拓扑和 GPU forward
 
 ## 研究目标
 
-这组文档服务于 TokenSpeed 架构评审、Ascend 适配决策和 PoC 设计，重点回答五个问题：
+这组文档服务于 TokenSpeed 架构评审、Ascend 适配判断和技术报告/PPT 内容设计，重点回答五个问题：
 
 1. **TokenSpeed 具体怎么实现？**  
    从进程、C++/Python 边界、CPU/GPU 边界、rank/DP/TP 边界、请求状态和 KV ownership 逐层展开。
@@ -60,8 +60,8 @@ KV page ownership、cache movement、模型层并行拓扑和 GPU forward
 4. [并行策略 / Placement Compiler 深挖](04-parallel-strategy-and-placement.md)  
    解释 split parallelism 不是 CLI 参数堆叠，而是如何落到 Mapping、process group、CommManager、placement compiler 和模型 forward。
 
-5. [性能收益模型与 PoC 胜负线](05-performance-model-and-poc.md)  
-   把每个优化点映射到应移动的 counter，补充收益归因、并行策略拆解实验、vLLM 复制难度矩阵，以及 910C / 950DT PoC 胜负线。
+5. [架构竞争力与性能归因](05-architecture-competitiveness.md)
+   从 SMG、Scheduler/KV、EventLoop、split parallelism、placement compiler 和 MLA/kernel 六个角度判断 TokenSpeed 是否真的有架构竞争力，以及 vLLM/vLLM-Ascend 的复制难度。
 
 6. [代码地图与未闭合问题](06-code-map-and-open-questions.md)  
    列出当前已经读过的源码入口、已经确认的判断边界，以及下一步还需要继续验证的关键问题。

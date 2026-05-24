@@ -559,13 +559,13 @@ SMG 的收益不应该用 “TPM/GPU 提升” 单独衡量，因为它主要影
 | p95 ITL | engine 为主 | 不退化 | parser/streaming 不应拖慢 chunk 输出 |
 | worker load skew / DP skew | SMG + engine | 降低 | routing policy 不应为了 cache hit 造成严重倾斜 |
 
-对于 910C / 950DT PoC，SMG 相关验证可以这样设计：
+对于架构竞争力判断，SMG 相关性能信号可以这样理解：
 
-1. 固定 TokenSpeed engine 参数，开关 tokenizer L0/L1 cache，测 gateway prepare latency 和 TTFT。
-2. 固定 agent conversation，比较 routing policy 对 backend prefix hit 的影响。
-3. 构造 function tools 与 MCP hosted tools 两类请求，分别测外部 tool loop 和 SMG 内部 tool loop 的 p95。
-4. 对 DeepSeek V4 / Kimi-K2 分别测 parser parse_complete / parse_incremental 开销，确认 parser 不成为短 decode step 的尾延迟来源。
-5. 在多 worker / 多 DP 配置下观测 cache hit 与 load skew 的 tradeoff，而不是只看平均吞吐。
+1. tokenizer L0/L1 cache 主要影响 gateway prepare latency 和 TTFT，不应归因到 engine KV。
+2. routing policy 只有在提高 backend prefix locality 时，才和 engine KV reuse 形成组合竞争力。
+3. function tools 与 MCP hosted tools 的差异属于 agent runtime / gateway orchestration，不是 engine pause/resume。
+4. parser parse_complete / parse_incremental 更偏兼容性和尾延迟风险，不是核心护城河。
+5. 多 worker / 多 DP 下的关键是 cache hit 与 load skew 的 tradeoff，而不是单独的平均吞吐。
 
 ## 10. 当前结论与报告写法建议
 

@@ -360,7 +360,7 @@ TokenSpeed 的优化点要对应这些具体问题：
 2. `02-request-lifecycle.md`：以一条 generate 请求为线索讲清楚上下文如何在系统内流动。
 3. `03-agent-kv-management.md`：Scheduler/KV/EventLoop 如何服务 agent 场景。
 4. `04-parallel-strategy-and-placement.md`：并行策略、Mapping、CommManager、placement compiler 和 DeepSeek V4 实际路径。
-5. `05-performance-model-and-poc.md`：把机制转成 counter 和 PoC 胜负线。
+5. `05-architecture-competitiveness.md`：把机制转成架构竞争力和性能归因判断。
 6. `06-code-map-and-open-questions.md`：已读代码、判断边界和未闭合问题。
 
 之前的 4+1 草稿可以作为中间材料，但不应再作为架构主依据；正式解读应以本文的 runtime boundary view 和请求生命周期图为主。
