@@ -2,32 +2,34 @@
 
 更新时间：2026-05-21
 
-本目录整理的是一组面向 **Ascend 910C + 950DT 适配决策** 的 TokenSpeed 源码分析文档。它不是官方使用手册，也不是功能清单，而是回答一个更尖锐的问题：
+本目录整理的是一组面向 **TokenSpeed 架构评估与 Ascend 910C + 950DT 适配判断** 的源码分析文档。它不是官方使用手册，也不是功能清单，而是回答一个更尖锐的问题：
 
 > TokenSpeed 的核心能力到底是如何实现的？这些能力对 DeepSeek V4 / Kimi 类 MoE 与 agentic workload 有什么价值？vLLM / vLLM-Ascend 是不是容易迁移复制？
 
-此前提交的版本过于像英文摘要，缺少系统架构、请求流、KV 生命周期和并行执行协议的展开。这一版重新按“技术解读”组织：先讲 TokenSpeed 是什么样的运行时系统，再用一条请求在系统内的流动把 Scheduler/KV、并行策略、placement compiler 和性能收益挂起来。
+此前提交的版本过于像英文摘要，缺少系统架构、请求流、KV 生命周期和并行执行协议的展开。这一版重新按“技术解读”组织：先讲 TokenSpeed 是什么样的运行时系统，再用一条请求在系统内的流动把 SMG gateway、Scheduler/KV、并行策略、placement compiler 和性能收益挂起来。
 
-## 一句话结论
+## 一句话架构描述
 
 TokenSpeed 不应被理解成“带 C++ scheduler 和 MLA kernel 的 vLLM 类 serving 后端”。更准确的理解是：
 
 ```text
-TokenSpeed 是一个把请求生命周期、KV page ownership、cache movement、
-模型层并行拓扑和 GPU forward 物化连接成闭环的推理运行时。
+TokenSpeed + SMG 是一套把 agent-facing gateway、请求生命周期、
+KV page ownership、cache movement、模型层并行拓扑和 GPU forward
+物化连接成闭环的推理运行时系统。
 ```
 
-它最值得研究的地方不是单点功能，而是几个运行时协议是否形成了架构级优势：
+它最值得研究的地方不是单点功能，而是几个运行时协议如何形成系统级实现差异：
 
 - C++ Scheduler 把 request FSM 和 KV page ownership 绑在一起；
 - Python EventLoop 把 cache op、forward op、output feedback 串成可 overlap 的执行闭环；
 - ModelExecutor 把 C++ 的逻辑 page plan 物化为 GPU 侧 `req_to_page`、`InputBuffers`、`ForwardContext`；
 - Mapping / CommManager / placement compiler 把 attention、dense、MoE 的不同并行域带进模型执行；
 - DeepSeek V4 路径进一步加入 latent/compressed KV、paged cache group、MoE backend 和 token-aware communication。
+- SMG gateway 承担 OpenAI protocol、chat template、tokenizer cache、tool/reasoning parser、MCP tool loop 和 worker routing，为 engine 侧 KV reuse 提供稳定输入和路由前提。
 
 ## 研究目标
 
-这组文档服务于 TokenSpeed 架构评审、Ascend 适配决策和 PoC 设计，重点回答五个问题：
+这组文档服务于 TokenSpeed 架构评审、Ascend 适配判断和技术报告/PPT 内容设计，重点回答五个问题：
 
 1. **TokenSpeed 具体怎么实现？**  
    从进程、C++/Python 边界、CPU/GPU 边界、rank/DP/TP 边界、请求状态和 KV ownership 逐层展开。
@@ -44,6 +46,49 @@ TokenSpeed 是一个把请求生命周期、KV page ownership、cache movement�
 5. **vLLM / vLLM-Ascend 是否容易复制？**  
    每个机制都要区分：config 可复制、model patch 可复制、runtime protocol 可复制，还是需要架构级重构。
 
+## 当前目标：从架构描述走向竞争力验证
+
+当前分析要回答一个具体问题：
+
+TokenSpeed 在 agent workload 下，相比 vLLM 和 TensorRT-LLM 是否有可验证优势？
+
+这组文档不应预设答案是“有”。它需要区分：
+
+- 已验证优势
+- 潜在优势
+- 架构差异
+- 能力持平
+- 劣势
+- 需要 benchmark 证据的未知项
+
+分析中应避免把设计意图直接转换成性能结论。
+
+尤其是下面这些判断必须保持证据边界：
+
+- SMG gateway 行为不等于 TokenSpeed engine 行为。
+- Tool-call parsing 主要是 serving-layer 或 gateway-layer 职责。
+- 除非代码路径证明，否则 tool calls 不应被视为 engine-native request states。
+- 除非 runtime trace 证明，否则 tool wait 不应被描述成自动 DDR KV offload 和 same-request resume。
+- 除非目标模型路径支持，否则 DeepSeek V4 hierarchical KVStore 不应被描述为已验证优势。
+- C++ Scheduler 应被视为潜在 CPU-control-plane 优势，而不是已验证优势。
+- vLLM 和 TensorRT-LLM 应被视为强 baseline，而不是弱 baseline。
+
+竞争力验证框架见：
+
+- [TokenSpeed Competitiveness Validation Framework](08-competitiveness-validation-framework.md)
+
+该文档定义：
+
+- 什么才算优势
+- TokenSpeed / vLLM / TensorRT-LLM 决策矩阵
+- 可能 TokenSpeed 优势的 claim ledger
+- 最小 agent benchmark 协议
+- 报告和 PPT 可使用的安全结论模板
+
+当前推荐定位：
+
+TokenSpeed 是一个 high-potential inference runtime。它可能的优势在于 scheduler、KV lifecycle 和 agent workload runtime integration。当前证据支持进一步评估，但不支持对 vLLM 或 TensorRT-LLM 下最终优越性结论。
+
 ## 阅读顺序
 
 1. [TokenSpeed Runtime 架构纠偏](01-runtime-architecture.md)  
@@ -58,18 +103,27 @@ TokenSpeed 是一个把请求生命周期、KV page ownership、cache movement�
 4. [并行策略 / Placement Compiler 深挖](04-parallel-strategy-and-placement.md)  
    解释 split parallelism 不是 CLI 参数堆叠，而是如何落到 Mapping、process group、CommManager、placement compiler 和模型 forward。
 
-5. [性能收益模型与 PoC 胜负线](05-performance-model-and-poc.md)  
-   把每个优化点映射到应移动的 counter，说明收益不能线性相加，以及 910C / 950DT PoC 应该怎么判定成败。
+5. [架构与实现客观对照](05-architecture-comparison.md)
+   横向对比 TokenSpeed、vLLM V1、TensorRT-LLM 的整体架构，并用同一条带 tool call 的 agent 请求贯穿 CPU 控制面和 KV 生命周期，说明三者如何处理同一类问题，不提前给出竞争力结论。
 
 6. [代码地图与未闭合问题](06-code-map-and-open-questions.md)  
    列出当前已经读过的源码入口、已经确认的判断边界，以及下一步还需要继续验证的关键问题。
 
-## 当前判断边界
+7. [SMG Gateway 技术拆解](07-smg-gateway-runtime.md)
+   单独拆解 SMG 的进程边界、gateway request pipeline、tool/reasoning parser、MCP tool loop、worker routing，以及它和 TokenSpeed engine 的职责切分。
+
+8. [TokenSpeed 竞争力验证框架](08-competitiveness-validation-framework.md)
+   定义什么才算 verified advantage / potential advantage / parity / unknown，并给出 agent workload 的最小验证协议、claim ledger 和安全结论模板。
+
+## 当前事实边界
 
 为了避免技术判断过度包装，当前结论保留这些边界：
 
 - **不应声称 TokenSpeed 有 tool-call 专用 DDR KV offload。**  
   当前读到的 tool call 主要表现为 chat template / stop token / normal finish path，没有看到 `ToolCallEvent -> offload this request KV to DDR` 的专门策略。
+
+- **不应把 SMG gateway 行为写成 TokenSpeed engine 行为。**
+  `--tool-call-parser`、chat template、tokenizer cache、MCP tool loop 和 OpenAI-compatible response formatting 属于 SMG；engine 侧主要接收 tokenized generate request 与 sampling constraints。
 
 - **不应把 DeepSeek V4 hierarchical KVStore 当成已落地收益。**  
   当前分支仍要求 DeepSeek V4 baseline 使用 `--disable-kvstore`，`DeepseekV4TokenToKVPool` 的 offload / reload 路径也明确未实现。
@@ -77,8 +131,8 @@ TokenSpeed 是一个把请求生命周期、KV page ownership、cache movement�
 - **不应声称 DeepSeek V4 已完全走 generic placement compiler。**  
   DeepSeek V4 当前实际路径更像手写模型逻辑 + `CommManager` + 自定义 attention/MoE；placement compiler 是通用基础设施，不能直接等同于 V4 主路径。
 
-- **不应把 MLA kernel 作为最大护城河。**  
-  vLLM 主线已经有 MLA / DeepSeek V4 相关 KV cache spec 与 runtime 支持，单 kernel 的护城河下降；仍有价值的是端到端 latent-KV execution、metadata、layout、prefill/decode 切换与 runtime 物化。
+- **不应把 MLA kernel 作为最大差异点。**
+  vLLM 主线已经有 MLA / DeepSeek V4 相关 KV cache spec 与 runtime 支持，单 kernel 的差异会被快速吸收；仍值得分析的是端到端 latent-KV execution、metadata、layout、prefill/decode 切换与 runtime 物化。
 
 ## 技术解读主线
 
@@ -94,7 +148,7 @@ TokenSpeed 是一个把请求生命周期、KV page ownership、cache movement�
 2. **请求流：一条消息如何在 TokenSpeed 中执行**  
    展示 admission、ExecutionPlan、CacheOp、ForwardOp、OutputProcessor、scheduler.advance 的闭环。
 
-3. **Agent Runtime / KV Ownership：为什么它可能是最大护城河**  
+3. **Agent Runtime / KV Ownership：机制如何随请求状态迁移**
    用 request FSM 状态表讲清楚 page ownership 如何随 Submitted / Prefilling / Decoding / Draining / Retracting / Finished 迁移。
 
 4. **并行策略：不是支持 EP，而是不同 layer family 的 execution domain**  

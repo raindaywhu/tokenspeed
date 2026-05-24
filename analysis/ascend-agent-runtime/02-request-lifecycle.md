@@ -239,6 +239,8 @@ tool-call-parser:
 
 因此，对“tool call 请求”的第一个结论是：tool-call parser 不在 Scheduler Worker / C++ Scheduler 内。它是 SMG gateway 的职责。
 
+SMG 的进程边界、request pipeline、parser、MCP tool loop 和 worker routing 已单独拆到 [SMG Gateway 技术拆解](07-smg-gateway-runtime.md)，本文后续只保留与 TokenSpeed request lifecycle 相关的调用边界。
+
 ### T0.5. tool 相关解析其实分三段
 
 如果把“tool 解析”拆开看，它不是单个函数：

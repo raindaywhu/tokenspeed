@@ -214,8 +214,8 @@ CacheOp:   同时提交 host -> device loadback
 ```text
 TokenSpeed 的通用 runtime 已经把 device/host/L3 KV movement 编入 scheduler plan；
 但 DeepSeek V4 当前路径禁用 hierarchical kvstore。
-对 910C/950DT PoC，短期应优先验证 device prefix reuse、page ownership、
-decode reserve、retract 语义和 DP cache-aware dispatch；
+对架构竞争力判断，短期应优先看 device prefix reuse、page ownership、
+decode reserve、retract 语义和 DP cache-aware dispatch 是否构成完整 runtime 协议；
 host/L2/L3 是后续适配目标，不应当被提前记入收益。
 ```
 
@@ -735,9 +735,9 @@ Agent runtime 中用户取消、tool timeout、grammar invalid、parallel branch
 | cache-aware DP dispatch | pages/rank variance、rank queue p95 | 多 DP 长 session | 5-15% tail，取决于 DP skew |
 | abort / grammar admission | wasted decode steps、slot cleanup latency | tool timeout / cancellation 多 | 低到中，但对 p95 有价值 |
 
-### 12.1 PoC 应该采集的指标
+### 12.1 架构竞争力判断应关注的性能信号
 
-必须补的 runtime counters：
+正式报告不需要展开实验计划，但需要说明这些 runtime 信号能支撑竞争力判断：
 
 ```text
 prefix/cache
@@ -797,8 +797,8 @@ agent runtime
 6. **为什么 vLLM 不容易小 patch 复制**
    - 单点能力可复制，完整 ownership protocol 是 scheduler/KV/event loop 架构级复制。
 
-7. **收益如何验证**
-   - 以 counters 和 workload traces 说明 10-25% 只在 repeated-prefix + memory-pressure trace 下成立，不是所有场景平均提升。
+7. **收益如何归因**
+   - 说明 10-25% 这类区间只应被理解为 repeated-prefix + memory-pressure 场景下的可能改善，不是所有场景平均提升。
 
 ## 14. 当前结论
 
@@ -824,8 +824,8 @@ host-backed recoverable state，而不是简单 preempt 后重算。
 - host/device loadback、retract/recovery、async transfer pinning 是中高复杂度；
 - 完整 request FSM + KV ownership + event-loop cache/forward protocol 是架构级复制。
 
-对 910C/950DT PoC 的含义：
+对适配判断的含义：
 
 - 短期不要把 DeepSeek V4 hierarchical kvstore 收益算进去，因为当前 TokenSpeed V4 path 禁用 kvstore；
-- 优先验证 device KV ownership、prefix safe reuse、tail page / reserve、retract/recovery 语义、DP cache-aware dispatch；
+- 优先判断 device KV ownership、prefix safe reuse、tail page / reserve、retract/recovery 语义、DP cache-aware dispatch 是否形成 vLLM 不易小 patch 复制的 runtime protocol；
 - 如果 repeated-prefix + KV-pressure agent trace 下，TokenSpeed 相比 vLLM-Ascend 改善 p95/p99 且不靠单个 MLA kernel，那么 Scheduler/KV ownership 才能成立为核心护城河候选。

@@ -961,66 +961,61 @@ TokenSpeed 的 DeepSeek V4 已经把这些 patch 写得很深：
 
 这意味着在 910C/950DT 上，TokenSpeed 的“并行策略实现”不是开箱即用收益，而是提供了一套需要重建 backend 的 execution plan。
 
-### 12.3 910C 与 950DT 的不同验证目标
+### 12.3 910C 与 950DT 的架构判断差异
 
-910C 更适合验证：
+910C 更适合判断：
 
 - Mapping/CommManager/placement compiler 能否在 Ascend runtime 表达出来。
 - HCCL group 与 uneven token collective 是否可行。
 - 模型 correctness。
 - 小规模 p95 是否不退化。
 
-950DT 更适合验证：
+950DT 更适合判断：
 
 - EP all-to-all 是否有足够带宽/低延迟。
 - MoE grouped GEMM 是否能接近硬件上限。
 - attention DP + dense TP + MoE EP 组合是否真的优于 uniform TP。
 - agentic workload 的 TPM/GPU 和 p95 是否拉开。
 
-## 13. PoC 建议：并行策略这章怎么实证
+## 13. 架构竞争力判断：并行策略这章怎么讲
 
-### 13.1 最小实验矩阵
+### 13.1 不要讲成“支持 EP”
 
-先不要平均测试所有组合。建议围绕 V4/Kimi workload 做 4 组：
-
-| 实验 | attention | dense/shared | MoE | 目的 |
-| --- | --- | --- | --- | --- |
-| A baseline | uniform TP | uniform TP | TP 或 EP | 模拟传统单策略 |
-| B split no EP | attention 小 TP/DP | dense TP | MoE TP | 看 layer-family split 本身 |
-| C split + EP | attention DP/小 TP | dense TP | MoE EP | 看 V4/Kimi 核心策略 |
-| D split + EP + low-latency all2all | 同 C | 同 C | EP + optimized dispatch | 看真正性能上限 |
-
-### 13.2 必须做 ablation
-
-为了避免把收益误归因给单个 kernel：
-
-- 固定 MoE backend，只切 uniform vs split mapping。
-- 固定 mapping，只切 normal vs low_latency all-to-all。
-- 固定 mapping/backend，只切 allreduce fusion。
-- 固定请求分布，分别测 prefill-heavy 和 decode-heavy。
-- 单独测 rank token imbalance 对 p95 的影响。
-
-### 13.3 胜负线
-
-并行策略这一章可以设单独胜负线：
+并行策略这一章的结论不应写成：
 
 ```text
-相比 vLLM-Ascend baseline:
-
-1. decode-heavy agentic workload:
-   p95 ITL 不退化，TPM/GPU +10-20% 起步。
-
-2. MoE-heavy workload:
-   MoE dispatch+combine 占 step latency 的比例下降。
-
-3. 长上下文多轮 prefix:
-   attention local layout 不因 split strategy 导致质量/正确性问题。
-
-4. 综合目标:
-   与 Scheduler/KV 叠加后，整系统 TPM/GPU +20-30%，TPS/User 不退化。
+TokenSpeed 支持 EP，所以对 MoE 有优势。
 ```
 
-如果只看到单个 MLA/kernel 带来的收益，而并行策略 ablation 没有收益，则应该优先反哺 vLLM-Ascend，而不是完整适配 TokenSpeed。
+这太浅。更准确的架构判断是：
+
+```text
+TokenSpeed 把 attention、dense、MoE 放在不同 execution domain，
+再用 Mapping、CommManager、token-aware collective 和 MoE backend
+把不同 domain 之间的 hidden-state movement 系统化。
+```
+
+### 13.2 竞争力来自三层耦合
+
+| 层级 | 具体机制 | 竞争力来源 |
+|---|---|---|
+| 策略表达 | attention/dense/MoE 三套 Mapping | 不同 layer family 不被统一 TP/DP 绑死 |
+| 通信落地 | CommManager AR/RSAG、residual placement、global token counts | hidden-state movement 按真实 token 分布执行 |
+| 后端承载 | DeepEP / MegaMoE / grouped expert GEMM / attention layout | 策略能转成真实 MoE 和 latent-KV 性能 |
+
+如果只复制第一层参数，不复制第二层通信协议和第三层 backend，竞争力不成立。
+
+### 13.3 对 vLLM/vLLM-Ascend 的复制判断
+
+| 复制内容 | 难度 | 判断 |
+|---|---|---|
+| 增加 split parallelism 参数 | 低 | config-level，不构成护城河 |
+| 为模型手写 attention/dense/MoE group | 中 | model patch，能追上部分能力 |
+| weight loader / KV layout / MoE backend 全部读统一 Mapping | 中高 | model-runtime 协同 |
+| token-aware all-gather/reduce-scatter + idle forward + residual placement | 高 | architecture-level |
+| Ascend 上复现 DeepEP/MegaMoE 等价 dispatch-combine | 高 | 后端与硬件协同 |
+
+因此，并行策略的架构竞争力应写成“多 execution domain + token-aware communication + backend 承载”的组合，而不是单独的 EP 支持。
 
 ## 14. 本章对技术报告结构的改写建议
 
