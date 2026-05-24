@@ -1,219 +1,225 @@
-# TokenSpeed Competitiveness Validation Framework
+# TokenSpeed 竞争力验证框架
 
-## 1. Purpose
+## 1. 目标
 
-This document defines how to evaluate whether TokenSpeed has real advantages over vLLM and TensorRT-LLM for agent workloads.
+本文定义如何评估 TokenSpeed 在 agent workload 下，相比 vLLM 和 TensorRT-LLM 是否真的具备优势。
 
-The goal is not to assume that TokenSpeed is better. The goal is to separate:
+本文不预设 TokenSpeed 更好，而是把结论拆成几类：
 
-- verified advantages
-- potential advantages
-- architectural differences
-- parity areas
-- disadvantages
-- unknowns that require benchmark or profiling evidence
+- 已验证优势
+- 潜在优势
+- 架构差异
+- 能力持平
+- 劣势
+- 需要 benchmark 或 profiling 证据的未知项
 
-A feature should not be described as an advantage only because TokenSpeed has a different architecture. It should be described as an advantage only when the difference creates measurable benefits under the same workload, model, hardware, and serving constraints.
+不能只因为 TokenSpeed 架构不同，就把某个能力描述成优势。只有当这种差异在相同 workload、模型、硬件和 serving 约束下带来可测量收益时，才应描述为优势。
 
-## 2. What Counts as an Advantage
+## 2. 什么才算优势
 
-A TokenSpeed capability should be classified as a verified advantage only if all three conditions are satisfied:
+一个 TokenSpeed 能力只有同时满足三个条件，才可以归类为已验证优势。
 
-1. Architecture difference
+1. 架构差异
 
-   TokenSpeed has a runtime mechanism that is meaningfully different from vLLM and TensorRT-LLM.
+   TokenSpeed 有一个与 vLLM 和 TensorRT-LLM 显著不同的 runtime 机制。
 
-2. Observable benefit
+2. 可观测收益
 
-   The mechanism improves a measurable serving property, such as:
+   该机制改善了某个可测量的 serving 属性，例如：
 
-   - lower CPU control-plane overhead
-   - smaller forward-to-forward gap
-   - lower TTFT
-   - lower TPOT
-   - better Round 2 TTFT in tool-call workflows
-   - higher prefix cache hit rate
-   - fewer KV evictions or recomputations
-   - better GPU utilization under agent traffic
-   - better tail latency under mixed prefill/decode/tool workloads
+   - 更低的 CPU 控制面开销
+   - 更小的 forward-to-forward gap
+   - 更低的 TTFT
+   - 更低的 TPOT
+   - tool-call 工作流中更低的 Round 2 TTFT
+   - 更高的 prefix cache hit rate
+   - 更少的 KV eviction 或 recomputation
+   - agent traffic 下更高的 GPU 利用率
+   - mixed prefill/decode/tool workload 下更好的尾延迟
 
-3. Reproducible evidence
+3. 可复现实验证据
 
-   The benefit is reproduced under a controlled benchmark with:
+   该收益在受控 benchmark 中可复现，并且至少控制这些变量：
 
-   - same model
-   - same hardware
-   - same quantization
-   - same request distribution
-   - same tool schema size
-   - same concurrency level
-   - comparable tokenizer and chat template behavior
-   - comparable routing and cache locality policy
+   - 相同模型
+   - 相同硬件
+   - 相同量化方式
+   - 相同请求分布
+   - 相同 tool schema 大小
+   - 相同并发水平
+   - 可比的 tokenizer 和 chat template 行为
+   - 可比的 routing 和 cache locality 策略
 
-If only condition 1 is satisfied, the result should be called a potential advantage.
+如果只满足条件 1，应称为潜在优势。
 
-If conditions 1 and 2 are plausible but not measured, the result should be called a hypothesis.
+如果条件 1 和条件 2 在机制上合理，但尚未测量，应称为假设。
 
-If the benefit depends on code paths that are not implemented or not enabled for the target model, the result should be called unverified.
+如果收益依赖的代码路径尚未实现，或目标模型路径未启用该能力，应称为未验证。
 
-## 3. Result Labels
+## 3. 结果标签
 
-Use the following labels consistently.
+后续分析中应统一使用这些标签。
 
-| Label | Meaning |
+| 标签 | 含义 |
 |---|---|
-| Verified advantage | Supported by source code, profiling, and reproducible benchmark results |
-| Potential advantage | Supported by architecture analysis, but missing benchmark evidence |
-| Parity | Similar capability exists in vLLM or TensorRT-LLM |
-| Disadvantage | TokenSpeed is weaker, less mature, or less complete |
-| Unknown | Insufficient source or benchmark evidence |
-| Not applicable | The comparison dimension does not apply to the selected runtime or model path |
+| 已验证优势 | 有源码、profiling 和可复现 benchmark 结果共同支撑 |
+| 潜在优势 | 有架构分析支撑，但缺 benchmark 证据 |
+| 能力持平 | vLLM 或 TensorRT-LLM 已有类似能力 |
+| 劣势 | TokenSpeed 更弱、更不成熟或能力更不完整 |
+| 未知 | 缺少足够源码证据或 benchmark 证据 |
+| 不适用 | 该比较维度不适用于选定 runtime 或模型路径 |
 
-## 4. Decision Matrix
+## 4. 决策矩阵
 
-| Dimension | TokenSpeed | vLLM | TensorRT-LLM | Current Judgment |
+| 维度 | TokenSpeed | vLLM | TensorRT-LLM | 当前判断 |
 |---|---|---|---|---|
-| OpenAI-compatible protocol handling | Usually handled by SMG gateway or serving adapter | Mature OpenAI-compatible serving path | Usually handled by Triton, custom server, or upper-layer adapter | Not a TokenSpeed engine advantage |
-| Anthropic / Claude-style protocol handling | Gateway or adapter layer responsibility | Can be implemented via serving adapter; not EngineCore responsibility | Usually upper-layer responsibility | Protocol support is not an engine-level advantage |
-| Tool-call parser | Gateway / parser layer | API serving / ToolParser layer | Usually upper-layer adapter or server integration | Parity or integration difference, not engine advantage |
-| Tool-call lifecycle | Tool loop is likely handled outside the engine | Tool parser and tool loop handled outside EngineCore | Usually handled outside runtime backend | Engine-level advantage not proven |
-| Same-request tool wait and resume | Not proven | Not default behavior | Not default behavior | Unknown / do not claim |
-| Tool-call-specific DDR KV offload | Not proven | V1 does not rely on GPU-CPU KV swapping by default | Depends on KV cache manager and deployment | Unknown / do not claim |
-| Multi-round prefix reuse | Potentially possible through prefix cache, routing, and KV lifecycle | Mature prefix caching and KV manager capabilities | Supports KV reuse/offload depending on runtime configuration | Needs benchmark |
-| Scheduler control plane | C++ Scheduler and request FSM may reduce overhead | EngineCore scheduler is mature and widely used | C++ runtime with inflight batching and strong GPU execution stack | TokenSpeed potential advantage, not verified |
-| CPU fixed overhead in agent workloads | SMG + Python + C++ scheduler mixed path | API server + EngineCore + workers | Triton/server + C++ backend path | Needs profiling |
-| Forward-to-forward gap | Potentially reducible if scheduler and output path are efficient | Needs measurement | Usually strong when graph/runtime path is optimized | Needs profiling |
-| KV ownership model | TokenSpeed appears to emphasize logical KV ownership and page lifecycle | vLLM has mature KV block manager and prefix cache | TensorRT-LLM has mature KV cache mechanisms | Potential advantage only if measured |
-| DeepSeek / MLA specialization | Important TokenSpeed target path | Supported depending on model implementation and kernels | Strong NVIDIA kernel/runtime ecosystem | Unknown without model-specific benchmark |
-| MoE and communication maturity | Needs validation across TP/EP/DP/CP combinations | Mature distributed serving ecosystem | Strong NCCL/NVIDIA stack | TokenSpeed likely less mature |
-| Production readiness | Preview / early-stage | Mature production usage | Mature production usage | TokenSpeed disadvantage |
-| Observability and tooling | Needs explicit counters and profiler support | Mature ecosystem and metrics | Mature deployment/profiling stack | TokenSpeed disadvantage unless improved |
-| Ascend portability | Strategically possible if CUDA/NCCL assumptions are isolated | Requires backend support and adaptation | NVIDIA-centric | TokenSpeed potential strategic value, high engineering risk |
-| Kernel maturity | Depends on model path and custom kernels | Broad backend support | Very strong NVIDIA kernel stack | TokenSpeed not automatically advantaged |
-| Agent workload fit | Potentially strong if scheduler/KV/runtime integration is validated | Strong baseline; cannot be treated as weak | Strong backend, but upper-layer agent loop may be external | Needs controlled benchmark |
+| OpenAI-compatible protocol 处理 | 通常由 SMG gateway 或 serving adapter 处理 | OpenAI-compatible serving path 成熟 | 通常由 Triton、自定义 server 或上层 adapter 处理 | 不是 TokenSpeed engine 优势 |
+| Anthropic / Claude-style protocol 处理 | gateway 或 adapter 层责任 | 可通过 serving adapter 实现，不是 EngineCore 职责 | 通常是上层职责 | protocol 支持不是 engine-level 优势 |
+| tool-call parser | gateway / parser 层 | API serving / ToolParser 层 | 通常是上层 adapter 或 server integration | 能力持平或集成差异，不是 engine 优势 |
+| tool-call lifecycle | tool loop 大概率在 engine 外部 | tool parser 和 tool loop 在 EngineCore 外部处理 | 通常在 runtime backend 外部处理 | engine-level 优势未证明 |
+| same-request tool wait and resume | 未证明 | 默认不是该行为 | 默认不是该行为 | 未知 / 不应声称 |
+| tool-call-specific DDR KV offload | 未证明 | V1 默认不依赖 GPU-CPU KV swapping | 取决于 KV cache manager 和部署方式 | 未知 / 不应声称 |
+| 多轮 prefix reuse | 可能通过 prefix cache、routing 和 KV lifecycle 实现 | prefix caching 和 KV manager 能力成熟 | 按 runtime 配置支持 KV reuse/offload | 需要 benchmark |
+| scheduler control plane | C++ Scheduler 和 request FSM 可能降低开销 | EngineCore scheduler 成熟且广泛使用 | C++ runtime、inflight batching 和 GPU execution stack 强 | TokenSpeed 潜在优势，未验证 |
+| agent workload 的 CPU 固定开销 | SMG + Python + C++ scheduler 混合路径 | API server + EngineCore + workers | Triton/server + C++ backend 路径 | 需要 profiling |
+| forward-to-forward gap | 如果 scheduler 和 output path 足够高效，可能降低 | 需要测量 | graph/runtime 优化路径通常较强 | 需要 profiling |
+| KV ownership model | TokenSpeed 强调 logical KV ownership 和 page lifecycle | vLLM 有成熟 KV block manager 和 prefix cache | TensorRT-LLM 有成熟 KV cache 机制 | 只有测量后才可称为潜在优势之外的结论 |
+| DeepSeek / MLA specialization | 是 TokenSpeed 重要目标路径 | 取决于模型实现和 kernel 支持 | NVIDIA kernel/runtime 生态强 | 没有模型级 benchmark 前未知 |
+| MoE 和通信成熟度 | 需要验证 TP/EP/DP/CP 组合 | distributed serving 生态成熟 | NCCL/NVIDIA stack 强 | TokenSpeed 可能较不成熟 |
+| 生产成熟度 | preview / early-stage | 生产使用成熟 | 生产使用成熟 | TokenSpeed 劣势 |
+| 可观测性和工具链 | 需要显式 counter 和 profiler 支持 | 生态和 metrics 成熟 | 部署/profiling stack 成熟 | 除非补齐，否则 TokenSpeed 劣势 |
+| Ascend 可迁移性 | 若 CUDA/NCCL 假设被隔离，战略上可能可行 | 需要 backend 支持和适配 | NVIDIA-centric | TokenSpeed 潜在战略价值，但工程风险高 |
+| kernel 成熟度 | 取决于模型路径和 custom kernels | backend 支持广 | NVIDIA kernel stack 很强 | TokenSpeed 不自动占优 |
+| agent workload fit | 如果 scheduler/KV/runtime integration 被验证，可能较强 | 强 baseline，不能当弱基线 | backend 强，但上层 agent loop 可能外置 | 需要受控 benchmark |
 
-## 5. Core Interpretation
+## 5. 核心解释
 
-TokenSpeed's possible advantage is not generic tool-call support.
+TokenSpeed 可能的优势不是泛泛的 tool-call support。
 
-Tool-call parsing, protocol conversion, and MCP/tool execution loops are usually gateway or serving-layer responsibilities. vLLM also places tool-call parsing in the OpenAI-compatible serving path rather than in EngineCore or GPU workers.
+Tool-call parsing、protocol conversion、MCP/tool execution loop 通常是 gateway 或 serving-layer 职责。vLLM 也把 tool-call parsing 放在 OpenAI-compatible serving path，而不是 EngineCore 或 GPU workers 里。
 
-Therefore, the key question is not:
+因此关键问题不是：
 
-"Does TokenSpeed support tool calls?"
+```text
+TokenSpeed 是否支持 tool call？
+```
 
-The key question is:
+关键问题是：
 
-"Does TokenSpeed's scheduler, request FSM, KV lifecycle, and execution plan reduce the cost of multi-round agent serving compared with vLLM and TensorRT-LLM?"
+```text
+TokenSpeed 的 scheduler、request FSM、KV lifecycle 和 execution plan
+是否降低了多轮 agent serving 的成本，
+并且相比 vLLM 和 TensorRT-LLM 有可测量收益？
+```
 
-This requires measurement.
+这必须通过测量回答。
 
-## 6. Competitiveness Claim Ledger
+## 6. 竞争力 claim ledger
 
-### Claim 1: TokenSpeed C++ Scheduler may reduce agent CPU control-plane overhead
+### Claim 1：TokenSpeed C++ Scheduler 可能降低 agent CPU 控制面开销
 
-Status: Potential advantage, not verified.
+状态：潜在优势，未验证。
 
-Current evidence:
+当前证据：
 
-- TokenSpeed has an embedded C++ Scheduler and request FSM.
-- The scheduler appears to own request lifecycle and logical KV page state.
-- The design may reduce Python-side scheduling overhead if the critical path is actually moved into C++.
+- TokenSpeed 有嵌入式 C++ Scheduler 和 request FSM。
+- Scheduler 看起来持有 request lifecycle 和 logical KV page state。
+- 如果关键路径确实从 Python 移入 C++，该设计可能降低 Python-side scheduling overhead。
 
-Missing evidence:
+缺失证据：
 
 - per-step scheduler latency
 - forward-to-forward CPU gap
 - SMG gateway overhead
 - Python materialization overhead
 - output processing overhead
-- parser and structured output overhead
-- comparison against vLLM EngineCore and TensorRT-LLM inflight batching
+- parser 和 structured output overhead
+- 与 vLLM EngineCore、TensorRT-LLM inflight batching 的对比
 
-Required validation:
+需要验证：
 
-- same model
-- same hardware
-- same batch/concurrency
-- same tool schema
-- same prompt distribution
+- 相同模型
+- 相同硬件
+- 相同 batch/concurrency
+- 相同 tool schema
+- 相同 prompt distribution
 - CPU flamegraph
 - scheduler timeline
 - GPU idle gap measurement
 
-Risk of overclaiming:
+过度表述风险：
 
-Do not claim CPU advantage only because TokenSpeed has a C++ Scheduler. Agent workloads may still be dominated by gateway, tokenizer, parser, output processing, or Python orchestration overhead.
+不能只因为 TokenSpeed 有 C++ Scheduler，就声称 CPU 有优势。Agent workloads 仍可能主要受 gateway、tokenizer、parser、output processing 或 Python orchestration overhead 影响。
 
-### Claim 2: TokenSpeed may have stronger multi-round agent KV lifecycle control
+### Claim 2：TokenSpeed 可能有更强的多轮 agent KV lifecycle control
 
-Status: Potential advantage, not verified.
+状态：潜在优势，未验证。
 
-Current evidence:
+当前证据：
 
-- TokenSpeed design discusses request FSM, page allocation, retract/loadback/writeback concepts, and KV ownership.
-- This could be useful for multi-round agent workloads if KV retention and prefix reuse are coordinated with routing and scheduler decisions.
+- TokenSpeed 设计中包含 request FSM、page allocation、retract/loadback/writeback 和 KV ownership 概念。
+- 如果 KV retention 和 prefix reuse 能与 routing、scheduler decision 协同，这可能有利于多轮 agent workload。
 
-Missing evidence:
+缺失证据：
 
-- whether tool-call completion retains KV
-- whether Round 2 can reuse Round 1 prefix KV reliably
-- whether routing preserves KV locality
-- whether KV is evicted, reloaded, or recomputed under pressure
-- whether target model paths support hierarchical KVStore
-- whether DeepSeek V4 path supports the relevant KV lifecycle features
+- tool-call completion 后是否保留 KV
+- Round 2 是否能稳定复用 Round 1 prefix KV
+- routing 是否保持 KV locality
+- KV 在压力下是 evicted、reloaded 还是 recomputed
+- 目标模型路径是否支持 hierarchical KVStore
+- DeepSeek V4 路径是否支持相关 KV lifecycle features
 
-Required validation:
+需要验证：
 
-- Round 1 tool_call followed by mock tool wait and Round 2 tool_result
-- measure Round 2 TTFT
-- measure prefix cache hit rate
-- measure KV retained / evicted / recomputed / reloaded
-- measure worker locality hit rate
-- compare with vLLM and TensorRT-LLM under the same request distribution
+- Round 1 tool_call + mock tool wait + Round 2 tool_result
+- 测量 Round 2 TTFT
+- 测量 prefix cache hit rate
+- 测量 KV retained / evicted / recomputed / reloaded
+- 测量 worker locality hit rate
+- 在相同 request distribution 下与 vLLM 和 TensorRT-LLM 对比
 
-Risk of overclaiming:
+过度表述风险：
 
-Do not describe tool-call-specific DDR KV offload and same-request resume as implemented unless the code path and runtime trace prove it.
+除非代码路径和 runtime trace 证明，否则不能把 tool-call-specific DDR KV offload 和 same-request resume 描述成已实现能力。
 
-### Claim 3: TokenSpeed may be better positioned for agent-specific scheduling
+### Claim 3：TokenSpeed 可能更适合 agent-specific scheduling
 
-Status: Hypothesis.
+状态：假设。
 
-Current evidence:
+当前证据：
 
-- TokenSpeed has a request FSM and execution-plan-oriented design.
-- Agent workloads have different characteristics from normal chat: shorter bursts, more round trips, larger shared tool prefixes, and higher CPU fixed overhead.
+- TokenSpeed 有 request FSM 和 execution-plan-oriented design。
+- Agent workloads 与普通 chat 不同：更短 burst、更多 round trip、更大的共享 tool prefix、更高的 CPU 固定开销。
 
-Missing evidence:
+缺失证据：
 
-- whether scheduler policies distinguish agent rounds from normal chat
-- whether tool schema or structured output constraints affect scheduling decisions
-- whether Round 2 requests receive special locality-aware scheduling
-- whether request FSM improves fairness, tail latency, or cache retention
+- scheduler policy 是否区分 agent rounds 和普通 chat
+- tool schema 或 structured output constraints 是否影响 scheduling decision
+- Round 2 requests 是否获得特殊 locality-aware scheduling
+- request FSM 是否改善 fairness、tail latency 或 cache retention
 
-Required validation:
+需要验证：
 
-- mixed workload benchmark with normal chat and agent traffic
+- normal chat 与 agent traffic 混合 workload
 - P50/P90/P99 latency
 - queueing delay
 - scheduler decision trace
 - per-request cache lifecycle trace
 
-Risk of overclaiming:
+过度表述风险：
 
-Do not claim agent-aware scheduling unless the scheduler actually observes and uses agent-relevant state.
+除非 scheduler 实际观测并使用 agent-relevant state，否则不能声称 agent-aware scheduling。
 
-### Claim 4: TokenSpeed may be strategically useful for Ascend adaptation
+### Claim 4：TokenSpeed 可能对 Ascend 适配有战略价值
 
-Status: Strategic hypothesis, high engineering risk.
+状态：战略假设，工程风险高。
 
-Current evidence:
+当前证据：
 
-- TokenSpeed separates scheduling, model execution, and gateway concerns.
-- It is not inherently tied to TensorRT-LLM's NVIDIA-only runtime stack at the same level.
+- TokenSpeed 拆分了 scheduling、model execution 和 gateway concerns。
+- 它不像 TensorRT-LLM 那样深度绑定 NVIDIA-only runtime stack。
 
-Missing evidence:
+缺失证据：
 
 - HCCL replacement plan for NCCL assumptions
 - CUDA stream/event equivalent behavior
@@ -222,61 +228,61 @@ Missing evidence:
 - MLA/MoE kernel availability
 - memory allocator compatibility
 - distributed executor compatibility
-- performance evidence on Ascend
+- Ascend 上的性能证据
 
-Required validation:
+需要验证：
 
-- minimal decode path on Ascend
+- Ascend 上的最小 decode path
 - attention kernel benchmark
 - MoE dispatch benchmark
 - scheduler-worker communication benchmark
 - KV cache allocation and reuse benchmark
 
-Risk of overclaiming:
+过度表述风险：
 
-Architecture portability does not imply kernel portability. Ascend adaptation risk is concentrated in communication, memory management, custom kernels, and graph execution.
+架构可迁移不代表 kernel 可迁移。Ascend 适配风险集中在通信、内存管理、自定义 kernel 和 graph execution。
 
-### Claim 5: TokenSpeed may be better for DeepSeek-style MLA/MoE workloads
+### Claim 5：TokenSpeed 可能更适合 DeepSeek-style MLA/MoE workload
 
-Status: Unknown.
+状态：未知。
 
-Current evidence:
+当前证据：
 
-- TokenSpeed appears to target specific large-model inference paths such as Kimi/DeepSeek-style workloads.
-- It may include model-specific execution and kernel integration.
+- TokenSpeed 看起来瞄准 Kimi/DeepSeek-style workload 等特定大模型推理路径。
+- 它可能包含 model-specific execution 和 kernel integration。
 
-Missing evidence:
+缺失证据：
 
-- comparable DeepSeek/MLA/MoE benchmark against vLLM and TensorRT-LLM
-- exact supported model path
+- 与 vLLM、TensorRT-LLM 的可比 DeepSeek/MLA/MoE benchmark
+- 确切 supported model path
 - kernel maturity
 - TP/EP/DP/CP combination support
 - memory footprint comparison
-- decode throughput and latency comparison
+- decode throughput 和 latency comparison
 - long-context behavior
 
-Required validation:
+需要验证：
 
-- same DeepSeek-style model
-- same quantization
-- same sequence length
-- same batch/concurrency
-- same GPU count
-- prefill and decode separated
+- 相同 DeepSeek-style model
+- 相同 quantization
+- 相同 sequence length
+- 相同 batch/concurrency
+- 相同 GPU count
+- prefill 和 decode 分开测量
 - MoE communication counters
 - attention/KV memory counters
 
-Risk of overclaiming:
+过度表述风险：
 
-Do not generalize from one optimized model path to all LLM inference workloads.
+不能从一个优化模型路径泛化到所有 LLM inference workloads。
 
-## 7. Minimal Agent Benchmark Protocol
+## 7. 最小 agent benchmark 协议
 
-### 7.1 Goal
+### 7.1 目标
 
-The benchmark must evaluate agent-serving behavior, not only generic tokens per second.
+Benchmark 必须评估 agent-serving 行为，而不能只评估通用 tokens per second。
 
-The key measurements are:
+关键测量项包括：
 
 - CPU control-plane overhead
 - forward-to-forward gap
@@ -287,22 +293,22 @@ The key measurements are:
 - prefix cache hit rate
 - KV retention and eviction
 - GPU utilization
-- tail latency under concurrency
+- concurrency 下的 tail latency
 
-### 7.2 Workload A: Baseline Chat
+### 7.2 Workload A：Baseline Chat
 
-Purpose:
+目的：
 
-Measure normal serving overhead without tools.
+测量无工具场景下的普通 serving overhead。
 
-Request shape:
+请求形态：
 
 - system prompt
 - one user message
 - no tools
 - max_tokens = 256
 
-Metrics:
+指标：
 
 - TTFT
 - TPOT
@@ -313,61 +319,61 @@ Metrics:
 - forward-to-forward gap
 - CPU utilization
 
-Interpretation:
+解释：
 
-This establishes the non-agent baseline. Any agent advantage must be compared against this baseline.
+这是非 agent baseline。任何 agent 优势都必须和这个 baseline 对比。
 
-### 7.3 Workload B: Tool Schema Without Tool Execution
+### 7.3 Workload B：Tool Schema Without Tool Execution
 
-Purpose:
+目的：
 
-Measure the cost of rendering and processing large tool schemas when the model does not call a tool.
+测量模型没有调用工具时，大 tool schema 的渲染和处理成本。
 
-Request shape:
+请求形态：
 
 - system prompt
 - user message
 - tools list with 8 / 32 / 128 tools
 - tool_choice = auto
-- prompt instructs model to answer normally without tool use
+- prompt 要求模型正常回答，不调用工具
 
-Metrics:
+指标：
 
 - chat template rendering time
 - tokenizer time
 - prompt token count
 - prefix cache hit rate
-- TTFT increase versus Workload A
+- 相比 Workload A 的 TTFT 增量
 - CPU preparation overhead
 - memory footprint
 
-Interpretation:
+解释：
 
-This isolates the cost of agent/tool schema overhead before any tool call happens.
+这个 workload 隔离 tool schema 本身带来的 agent overhead，不混入实际 tool call。
 
-### 7.4 Workload C: Two-Round Tool Call
+### 7.4 Workload C：Two-Round Tool Call
 
-Purpose:
+目的：
 
-Measure the real agent loop.
+测量真实 agent loop。
 
-Round 1:
+Round 1：
 
 - messages + tools
 - model emits tool_call
 
-Gateway/tool loop:
+Gateway/tool loop：
 
 - parse tool_call
 - execute mock tool
 - append tool_result
 
-Round 2:
+Round 2：
 
 - messages + previous assistant tool_call + tool_result
 - model emits final answer
 
-Metrics:
+指标：
 
 - Round 1 TTFT
 - Round 1 TPOT
@@ -380,17 +386,17 @@ Metrics:
 - worker locality hit rate
 - end-to-end latency
 
-Interpretation:
+解释：
 
-This is the most important benchmark for agent workloads. If TokenSpeed has an advantage, it should appear in Round 2 TTFT, CPU gap, prefix reuse, or cache lifecycle behavior.
+这是 agent workload 最重要的 benchmark。如果 TokenSpeed 有优势，它应该体现在 Round 2 TTFT、CPU gap、prefix reuse 或 cache lifecycle behavior 上。
 
-### 7.5 Workload D: Shared Long Prefix Multi-Session Agent Traffic
+### 7.5 Workload D：Shared Long Prefix Multi-Session Agent Traffic
 
-Purpose:
+目的：
 
-Measure prefix cache and routing behavior under concurrent agent workloads.
+测量并发 agent workload 下的 prefix cache 和 routing 行为。
 
-Request shape:
+请求形态：
 
 - long shared system prompt
 - shared tool schema
@@ -398,7 +404,7 @@ Request shape:
 - repeated Round 1 / Round 2 loops
 - varied user suffixes
 
-Metrics:
+指标：
 
 - prefix cache hit rate
 - cache eviction rate
@@ -410,24 +416,24 @@ Metrics:
 - GPU utilization
 - memory pressure
 
-Interpretation:
+解释：
 
-This benchmark tests whether TokenSpeed can turn shared agent prefixes into real serving efficiency.
+这个 benchmark 测试 TokenSpeed 是否能把 shared agent prefixes 转化为真实 serving efficiency。
 
-### 7.6 Workload E: Mixed Normal Chat and Agent Traffic
+### 7.6 Workload E：Mixed Normal Chat and Agent Traffic
 
-Purpose:
+目的：
 
-Measure whether agent workloads interfere with normal chat workloads.
+测量 agent workload 是否干扰普通 chat workload。
 
-Request shape:
+请求形态：
 
 - 70% normal chat
 - 30% two-round tool-call traffic
 - shared system prompt
 - mixed output lengths
 
-Metrics:
+指标：
 
 - normal chat TTFT/TPOT
 - agent Round 2 TTFT
@@ -437,15 +443,15 @@ Metrics:
 - cache pressure
 - GPU utilization
 
-Interpretation:
+解释：
 
-A production serving engine must handle mixed traffic. A specialized agent optimization should not severely degrade normal chat.
+生产 serving engine 必须能处理 mixed traffic。专门的 agent 优化不应严重伤害普通 chat。
 
-## 8. Required Instrumentation
+## 8. 必要观测指标
 
-The following counters or traces are required before making a strong competitiveness claim:
+在做强竞争力结论前，至少需要这些 counter 或 trace。
 
-### Gateway / API Layer
+### Gateway / API 层
 
 - request validation time
 - chat template rendering time
@@ -456,7 +462,7 @@ The following counters or traces are required before making a strong competitive
 - streaming response overhead
 - protocol conversion overhead
 
-### Engine / Scheduler Layer
+### Engine / Scheduler 层
 
 - request admission time
 - queueing time
@@ -467,7 +473,7 @@ The following counters or traces are required before making a strong competitive
 - output processing time
 - forward-to-forward gap
 
-### KV Cache Layer
+### KV Cache 层
 
 - prefix cache hit/miss
 - KV blocks allocated
@@ -478,7 +484,7 @@ The following counters or traces are required before making a strong competitive
 - host/device KV movement
 - cache locality by worker or DP rank
 
-### GPU Layer
+### GPU 层
 
 - forward time
 - attention time
@@ -490,7 +496,7 @@ The following counters or traces are required before making a strong competitive
 - HBM usage
 - kernel launch overhead
 
-### Distributed Layer
+### Distributed 层
 
 - DP routing decision
 - TP/PP/EP group configuration
@@ -499,50 +505,50 @@ The following counters or traces are required before making a strong competitive
 - MoE dispatch/combine time
 - rank skew
 
-## 9. Safe Conclusion Templates
+## 9. 安全结论模板
 
-### 9.1 Conservative Conclusion
+### 9.1 保守结论
 
-Based on current source-level analysis, TokenSpeed shows potential architectural differentiation in its C++ Scheduler, request FSM, and KV lifecycle design. However, there is not yet enough benchmark or profiling evidence to conclude that it is generally superior to vLLM or TensorRT-LLM for agent workloads.
+基于当前源码级分析，TokenSpeed 在 C++ Scheduler、request FSM 和 KV lifecycle design 上显示出潜在架构差异。但目前还没有足够 benchmark 或 profiling 证据证明它在 agent workload 下整体优于 vLLM 或 TensorRT-LLM。
 
-The most appropriate current conclusion is that TokenSpeed deserves deeper evaluation under controlled agent benchmarks.
+当前最合适的结论是：TokenSpeed 值得在受控 agent benchmark 下继续评估。
 
-### 9.2 Strong but Still Safe Conclusion
+### 9.2 较强但仍安全的结论
 
-TokenSpeed's most promising advantage is not generic tool-call support. Its possible advantage lies in tighter integration between request FSM, logical KV ownership, scheduler decisions, and execution-plan materialization.
+TokenSpeed 最有希望的优势不是 generic tool-call support，而是 request FSM、logical KV ownership、scheduler decisions 和 execution-plan materialization 之间更紧密的集成。
 
-If profiling confirms lower forward-to-forward CPU gap, better Round 2 prefix reuse, and lower tail latency under multi-round agent workloads, TokenSpeed could have a meaningful advantage for high-concurrency agent serving.
+如果 profiling 证明它在多轮 agent workload 下有更低的 forward-to-forward CPU gap、更好的 Round 2 prefix reuse 和更低的尾延迟，那么 TokenSpeed 可能在高并发 agent serving 上形成有意义的优势。
 
-### 9.3 Negative or Cautious Conclusion
+### 9.3 否定或谨慎结论
 
-Current evidence is insufficient to claim that TokenSpeed is superior to vLLM or TensorRT-LLM. TokenSpeed may have promising architecture, but vLLM and TensorRT-LLM have more mature production ecosystems, stronger observability, and more proven deployment paths.
+当前证据不足以声称 TokenSpeed 优于 vLLM 或 TensorRT-LLM。TokenSpeed 可能有 promising architecture，但 vLLM 和 TensorRT-LLM 有更成熟的生产生态、更强的可观测性和更已验证的部署路径。
 
-Without profiling and benchmark evidence, TokenSpeed should be described as a high-potential preview system rather than a proven superior runtime.
+在没有 profiling 和 benchmark 证据前，TokenSpeed 应被描述为 high-potential preview system，而不是已证明更优的 runtime。
 
-### 9.4 What Not to Say
+### 9.4 不应该说什么
 
-Do not say:
+不要说：
 
-- TokenSpeed already has stronger tool-call support than vLLM.
-- TokenSpeed engine directly understands OpenAI or Anthropic tool calls.
-- Tool wait automatically triggers DDR KV offload and same-request resume.
-- DeepSeek V4 hierarchical KVStore is already a proven advantage.
-- C++ Scheduler automatically means lower CPU overhead.
-- TokenSpeed is better than TensorRT-LLM without kernel-level benchmark.
-- vLLM is weak in agent serving without a fair benchmark.
-- SMG gateway capabilities are the same as TokenSpeed engine capabilities.
+- TokenSpeed 已经有比 vLLM 更强的 tool-call support。
+- TokenSpeed engine 直接理解 OpenAI 或 Anthropic tool calls。
+- Tool wait 会自动触发 DDR KV offload 和 same-request resume。
+- DeepSeek V4 hierarchical KVStore 已经是已验证优势。
+- C++ Scheduler 自动意味着更低 CPU overhead。
+- 没有 kernel-level benchmark 就说 TokenSpeed 优于 TensorRT-LLM。
+- 没有公平 benchmark 就说 vLLM 在 agent serving 上很弱。
+- SMG gateway capabilities 等同于 TokenSpeed engine capabilities。
 
-### 9.5 Recommended Positioning
+### 9.5 推荐定位
 
-TokenSpeed should be positioned as a high-potential inference runtime whose possible advantage lies in scheduler, KV lifecycle, and runtime integration for agent workloads.
+TokenSpeed 应被定位为一个高潜力推理运行时。它可能的优势在于调度器、KV 生命周期，以及面向 agent workload 的运行时集成。
 
-Current evidence supports further evaluation, but not a final superiority claim over vLLM or TensorRT-LLM.
+当前证据支持进一步评估，但不支持对 vLLM 或 TensorRT-LLM 下最终优越性结论。
 
-## 10. Recommended Next Steps
+## 10. 推荐下一步
 
-1. Add source-level citations for every major TokenSpeed claim.
-2. Add a runtime diagram separating SMG gateway, TokenSpeed engine, scheduler, and GPU execution.
-3. Add counters for scheduler time, cache operations, parser time, and forward-to-forward gap.
-4. Implement Workload C first because it best represents real tool-call agent behavior.
-5. Compare against vLLM before comparing against TensorRT-LLM.
-6. Only after source and benchmark evidence is available, upgrade potential advantages to verified advantages.
+1. 为每个主要 TokenSpeed 主张增加源码级引用。
+2. 增加一张分离 SMG gateway、TokenSpeed engine、scheduler 和 GPU execution 的运行时图。
+3. 增加 scheduler time、cache operations、parser time、forward-to-forward gap 的计数器。
+4. 优先实现 Workload C，因为它最接近真实 tool-call agent 行为。
+5. 先与 vLLM 对比，再与 TensorRT-LLM 对比。
+6. 只有在源码和 benchmark 证据都具备后，才能把潜在优势升级为已验证优势。

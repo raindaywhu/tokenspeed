@@ -46,48 +46,48 @@ KV page ownership、cache movement、模型层并行拓扑和 GPU forward
 5. **vLLM / vLLM-Ascend 是否容易复制？**  
    每个机制都要区分：config 可复制、model patch 可复制、runtime protocol 可复制，还是需要架构级重构。
 
-## Current Goal: From Architecture Description to Competitiveness Validation
+## 当前目标：从架构描述走向竞争力验证
 
-The current purpose of this analysis is to answer a specific question:
+当前分析要回答一个具体问题：
 
-Does TokenSpeed have verifiable advantages over vLLM and TensorRT-LLM for agent workloads?
+TokenSpeed 在 agent workload 下，相比 vLLM 和 TensorRT-LLM 是否有可验证优势？
 
-This document set should not assume the answer is yes. Instead, it should separate:
+这组文档不应预设答案是“有”。它需要区分：
 
-- verified advantages
-- potential advantages
-- architecture differences
-- parity areas
-- disadvantages
-- unknowns requiring benchmark evidence
+- 已验证优势
+- 潜在优势
+- 架构差异
+- 能力持平
+- 劣势
+- 需要 benchmark 证据的未知项
 
-The analysis should avoid converting design intent into performance conclusions.
+分析中应避免把设计意图直接转换成性能结论。
 
-In particular, the following claims must remain evidence-bounded:
+尤其是下面这些判断必须保持证据边界：
 
-- SMG gateway behavior is not the same as TokenSpeed engine behavior.
-- Tool-call parsing is primarily a serving-layer or gateway-layer responsibility.
-- Tool calls should not be treated as engine-native request states unless the code path proves it.
-- Tool wait should not be described as automatic DDR KV offload and same-request resume unless traces prove it.
-- DeepSeek V4 hierarchical KVStore should not be described as a proven advantage unless the target model path supports it.
-- C++ Scheduler should be treated as a potential CPU-control-plane advantage, not a verified advantage.
-- vLLM and TensorRT-LLM should be treated as strong baselines, not weak baselines.
+- SMG gateway 行为不等于 TokenSpeed engine 行为。
+- Tool-call parsing 主要是 serving-layer 或 gateway-layer 职责。
+- 除非代码路径证明，否则 tool calls 不应被视为 engine-native request states。
+- 除非 runtime trace 证明，否则 tool wait 不应被描述成自动 DDR KV offload 和 same-request resume。
+- 除非目标模型路径支持，否则 DeepSeek V4 hierarchical KVStore 不应被描述为已验证优势。
+- C++ Scheduler 应被视为潜在 CPU-control-plane 优势，而不是已验证优势。
+- vLLM 和 TensorRT-LLM 应被视为强 baseline，而不是弱 baseline。
 
-For the competitiveness validation framework, see:
+竞争力验证框架见：
 
 - [TokenSpeed Competitiveness Validation Framework](08-competitiveness-validation-framework.md)
 
-That document defines:
+该文档定义：
 
-- what counts as an advantage
-- a TokenSpeed / vLLM / TensorRT-LLM decision matrix
-- a claim ledger for possible TokenSpeed advantages
-- a minimal agent benchmark protocol
-- safe conclusion templates for reports and PPTs
+- 什么才算优势
+- TokenSpeed / vLLM / TensorRT-LLM 决策矩阵
+- 可能 TokenSpeed 优势的 claim ledger
+- 最小 agent benchmark 协议
+- 报告和 PPT 可使用的安全结论模板
 
-Current recommended positioning:
+当前推荐定位：
 
-TokenSpeed is a high-potential inference runtime whose possible advantage lies in scheduler, KV lifecycle, and runtime integration for agent workloads. Current evidence supports further evaluation, but not a final superiority claim over vLLM or TensorRT-LLM.
+TokenSpeed 是一个 high-potential inference runtime。它可能的优势在于 scheduler、KV lifecycle 和 agent workload runtime integration。当前证据支持进一步评估，但不支持对 vLLM 或 TensorRT-LLM 下最终优越性结论。
 
 ## 阅读顺序
 

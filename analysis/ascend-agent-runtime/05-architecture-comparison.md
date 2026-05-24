@@ -24,18 +24,18 @@
 
 本文不判断 TokenSpeed 是否明显更强，只列出架构差异、实现路径、边界条件和仍需验证的问题。
 
-## Note on Competitiveness Claims
+## 关于竞争力结论的说明
 
-This comparison should be read together with [TokenSpeed Competitiveness Validation Framework](08-competitiveness-validation-framework.md).
+本文应与 [TokenSpeed 竞争力验证框架](08-competitiveness-validation-framework.md) 一起阅读。
 
-The purpose of this comparison is not to claim that TokenSpeed is already superior to vLLM or TensorRT-LLM. The purpose is to identify which architectural differences could become real advantages if they are supported by source-level evidence, profiling counters, and reproducible benchmark results.
+本文的目的不是声称 TokenSpeed 已经优于 vLLM 或 TensorRT-LLM，而是识别哪些架构差异在得到源码证据、profiling counters 和可复现 benchmark 结果支撑后，才可能变成真实优势。
 
-In this document:
+在本文中：
 
-- "potential advantage" means architecture suggests a possible benefit, but benchmark evidence is still missing.
-- "verified advantage" should only be used when the benefit is proven under controlled workloads.
-- protocol-layer features such as tool-call parsing should not be treated as TokenSpeed engine advantages unless the engine itself observes and acts on that state.
-- SMG gateway capabilities must be distinguished from TokenSpeed engine capabilities.
+- “潜在优势”表示架构上可能带来收益，但仍缺 benchmark 证据。
+- “已验证优势”只能用于受控 workload 下已经证明收益的场景。
+- tool-call parsing 这类 protocol-layer feature 不应被视为 TokenSpeed engine 优势，除非 engine 本身观测并使用该状态。
+- 必须区分 SMG gateway capabilities 和 TokenSpeed engine capabilities。
 
 ## 0. 证据边界
 
