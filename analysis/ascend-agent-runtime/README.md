@@ -61,7 +61,7 @@ KV page ownership、cache movement、模型层并行拓扑和 GPU forward
    解释 split parallelism 不是 CLI 参数堆叠，而是如何落到 Mapping、process group、CommManager、placement compiler 和模型 forward。
 
 5. [性能收益模型与 PoC 胜负线](05-performance-model-and-poc.md)  
-   把每个优化点映射到应移动的 counter，说明收益不能线性相加，以及 910C / 950DT PoC 应该怎么判定成败。
+   把每个优化点映射到应移动的 counter，补充收益归因、并行策略拆解实验、vLLM 复制难度矩阵，以及 910C / 950DT PoC 胜负线。
 
 6. [代码地图与未闭合问题](06-code-map-and-open-questions.md)  
    列出当前已经读过的源码入口、已经确认的判断边界，以及下一步还需要继续验证的关键问题。
