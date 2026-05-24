@@ -61,7 +61,7 @@ KV page ownership、cache movement、模型层并行拓扑和 GPU forward
    解释 split parallelism 不是 CLI 参数堆叠，而是如何落到 Mapping、process group、CommManager、placement compiler 和模型 forward。
 
 5. [架构与实现客观对照](05-architecture-comparison.md)
-   横向对比 TokenSpeed、vLLM V1、TensorRT-LLM 的整体架构、agent CPU 控制面和 KV 管理实现，用架构图与实现路径说明三者如何处理同一类问题，不提前给出竞争力结论。
+   横向对比 TokenSpeed、vLLM V1、TensorRT-LLM 的整体架构，并用同一条带 tool call 的 agent 请求贯穿 CPU 控制面和 KV 生命周期，说明三者如何处理同一类问题，不提前给出竞争力结论。
 
 6. [代码地图与未闭合问题](06-code-map-and-open-questions.md)  
    列出当前已经读过的源码入口、已经确认的判断边界，以及下一步还需要继续验证的关键问题。

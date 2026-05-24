@@ -1,4 +1,4 @@
-# TokenSpeed / vLLM / TensorRT-LLM 架构与实现对照 v0.5
+# TokenSpeed / vLLM / TensorRT-LLM 架构与实现对照 v0.6
 
 更新时间：2026-05-24
 
@@ -15,6 +15,11 @@
   TokenSpeed 当前如何实现？
   vLLM V1 当前如何实现？
   TensorRT-LLM 当前如何实现？
+
+再用同一条带 tool call 的 agent 请求贯穿：
+  Round 1: messages + tools -> model emits tool_call
+  Tool wait: external tool executes
+  Round 2: messages + tool result -> model continues answer
 ```
 
 本文不判断 TokenSpeed 是否明显更强，只列出架构差异、实现路径、边界条件和仍需验证的问题。
@@ -250,6 +255,48 @@ flowchart LR
 | agent/tool 边界 | parser/tool loop 在 SMG，engine 不感知 tool object | API/tool examples 支持，engine 侧主要处理 tokenized request | serving/API 层支持 OpenAI examples，runtime 侧以 Executor request 为核心 |
 | 需要注意 | DeepSeek V4 hierarchical KVStore 当前不可作为已落地收益 | vLLM V1 已专门重构 CPU/KV 路径 | 强绑定 NVIDIA runtime 和 TensorRT engine |
 
+### 1.5 同一条 agent 请求的系统边界
+
+后续 CPU / KV 对照都基于同一条请求，不再抽象讨论：
+
+```text
+Round 1:
+  messages = [system, user]
+  tools = [get_weather(city, date)]
+  model output = tool_call(get_weather, {"city": "北京", "date": "明天"})
+
+Tool wait:
+  agent / gateway / app 执行 get_weather
+
+Round 2:
+  messages = [system, user, assistant(tool_call), tool(result)]
+  tools = same tool schema or reduced tool schema
+  model output = final answer
+```
+
+三个框架的共同点是：模型执行引擎通常不直接执行外部工具。真正进入 engine/executor 的通常是渲染后的 prompt、token ids、sampling 参数、grammar/constraint 或 executor request。差别在于 tool/template/parser/routing 这些 CPU 控制面放在什么层，以及 Round 2 是否能命中 Round 1/历史 prefix 的 KV。
+
+```mermaid
+flowchart LR
+  A["Agent App<br/>messages + tools"]
+  G["Gateway / API layer<br/>template + parser + routing"]
+  E["Engine / Executor<br/>scheduler + KV manager"]
+  M["GPU model forward"]
+  P["Parser / output adapter<br/>tool_call extraction"]
+  T["External tool runtime"]
+  R2["Round 2 request<br/>history + tool result"]
+
+  A --> G --> E --> M --> P --> T --> R2 --> G
+```
+
+| 阶段 | TokenSpeed | vLLM V1 | TensorRT-LLM |
+|---|---|---|---|
+| tool schema/template | SMG gateway / tokenizer wrapper | API server / serving layer | LLM API / serving layer |
+| parser/tool loop | SMG tool parser / MCP loop | API/server/tool calling layer，engine 文档不把它作为 scheduler 核心 | serving/API 层，Executor 侧以 request 为核心 |
+| engine 入口 | tokenized request + sampling/grammar constraint | processed request 进入 EngineCore | enqueueRequest(s) 进入 Executor |
+| Round 2 复用前提 | prompt 稳定 + worker routing + engine prefix cache | prompt 稳定 + APC / KV manager / routing | prompt 稳定 + KV reuse / optional cache-aware routing/events |
+| tool wait 期间 KV | 未看到 tool-call-specific DDR offload/resume | 官方 V1 guide 显示 GPU<>CPU KV swapping removed；可通过其他 KV connector/disagg 机制讨论 | `host_cache_size` 等 KV offload 能力存在，但具体 serving policy 由部署决定 |
+
 ## 2. 相同问题一：Agent CPU 高负载如何处理
 
 ### 2.1 问题本身
@@ -455,6 +502,77 @@ flowchart TB
 | CPU/GPU overlap | EventLoop overlap between forward and previous output/advance | multiprocess API/EngineCore split; persistent batch/chunked prefill per docs | CUDA Graph + Overlap Scheduler |
 | still in CPU critical path | parser/tool loop, IPC, EventLoop, output processor, Python materialization | API input/output, EngineCore scheduling, KV manager | executor scheduling, output handling, runtime callbacks |
 | unresolved for this report | real CPU time attribution per component | no vLLM source-level profiling here | NVIDIA-specific runtime assumptions |
+
+### 2.6 同一条 agent 请求的 CPU 控制面阶段对照
+
+这一节把上面的图拆成执行阶段。目标不是判断谁更快，而是明确每个框架在相同阶段把 CPU 工作放在哪里。
+
+```mermaid
+sequenceDiagram
+  participant APP as Agent App
+  participant G as Gateway / API
+  participant E as Engine / Executor
+  participant S as Scheduler / KV Manager
+  participant GPU as GPU Forward
+  participant P as Parser / Output
+  participant TOOL as External Tool
+
+  APP->>G: Round 1 messages + tools
+  G->>G: template / tokenize / parser constraint
+  G->>E: engine request
+  E->>S: admission + scheduling
+  S->>GPU: prefill + short decode
+  GPU-->>P: output tokens
+  P->>P: stop / detok / tool_call parse
+  P->>TOOL: execute tool
+  TOOL-->>APP: tool result
+  APP->>G: Round 2 history + tool result
+  G->>E: second engine request
+  E->>S: prefix lookup + scheduling
+  S->>GPU: mostly cached prefill + short decode
+```
+
+| CPU 阶段 | TokenSpeed 当前路径 | vLLM V1 当前路径 | TensorRT-LLM 当前路径 |
+|---|---|---|---|
+| Round 1 HTTP / protocol | SMG gateway | API Server Process | LLM API / serving layer |
+| chat template / tools rendering | SMG / tokenizer wrapper；tools 变成 prompt 或 constraint | API/input processing 层；EngineCore 文档关注 processed request | LLM API / serving 层，Executor request 不等于原始 OpenAI messages |
+| tokenizer cache / tokenization | SMG tokenizer L0/L1 + AsyncLLM/InputProcessor 路径 | API Server Process 处理 input processing / tokenization | LLM class / serving layer处理，具体依部署 |
+| grammar / structured constraint | SMG 生成约束；engine admission 的 GrammarManager 处理 ready/timeout/abort | guided decoding / structured output 属 API/engine 功能，但本文未深挖源码 | 支持取决于 LLM API / serving 集成；本文只看 Executor 文档 |
+| admission | EventLoop `_process_new_requests()`，处理 grammar、abort、L3 query、PD hints | EngineCore scheduler 接收 request 后统一调度 | Executor/PyExecutor loop fetch requests |
+| per-step schedule | C++ Scheduler `NextExecutionPlan()` 产出 `ForwardOp + CacheOp` | Unified Scheduler 分配 token budget，并和 KVCacheManager 交互 | Scheduler/CapacityScheduler 与 KVCacheManager 交互 |
+| GPU launch 固定开销 | Python ModelExecutor materialization + CUDA graph wrapper path；仍有 Python runtime | GPU Worker / ModelRunner / CUDA graph 相关能力 | CUDA Graph 是官方 runtime optimization |
+| output / detok | Generation OutputProcessor -> AsyncLLM OutputProcessor inline detok -> SMG parser | EngineCore/API Server output packets、detokenization/streaming | Sampler/output handling -> awaitResponses / streaming |
+| tool_call parse | SMG parser `parse_complete` / `parse_incremental` | API/server tool calling layer；不属于 V1 scheduler/KV 文档核心 | serving/API 层；Executor 不执行外部 tool |
+| tool wait | 外部 tool/MCP loop；engine request 已 finish | 外部 app/server loop；engine request 已 finish | 外部 app/server loop；Executor request 已 finish |
+| Round 2 request build | SMG 重新渲染 history + tool result；routing 可影响 worker locality | API server 重新处理 history + tool result | serving layer 重新 enqueue request |
+
+从这个阶段表可以得到几个中性事实：
+
+1. **CPU 高负载不是单个 scheduler 问题。**
+   template、tokenization、parser、detok、tool loop、per-step scheduling 都可能贡献 CPU 时间。
+
+2. **TokenSpeed 的 tool parser 不减轻 engine scheduler 本身的工作。**
+   它主要把 user-facing tool/protocol 工作放在 SMG，让 engine 看到 token-level request。
+
+3. **vLLM V1 和 TensorRT-LLM 都有独立 CPU 控制面设计。**
+   vLLM 是多进程 API/EngineCore/GPU worker；TensorRT-LLM 是 Executor loop + CUDA Graph + Overlap Scheduler。
+
+4. **需要避免的写法：**
+   不应写“TokenSpeed 有 C++ Scheduler，所以 agent CPU 高负载一定更低”。更准确的写法是“TokenSpeed 把 scheduler/KV 决策放进 C++，但 agent CPU 路径还包括 SMG、AsyncLLM、EventLoop、OutputProcessor 与 Python materialization”。
+
+### 2.7 CPU 控制面的待验证计数器
+
+如果后续要回答“到底谁解决了 CPU 高负载”，至少要拆这些计数器；本文目前只做架构对照，不声称这些计数器已经验证：
+
+| 计数器 | TokenSpeed 归因位置 | vLLM 归因位置 | TensorRT-LLM 归因位置 |
+|---|---|---|---|
+| template/tokenization CPU time | SMG / AsyncLLM | API Server Process | LLM API / serving layer |
+| scheduler step CPU time | C++ Scheduler + EventLoop overhead | EngineCore scheduler | Executor/PyExecutor scheduler |
+| input tensor materialization time | ModelExecutor / InputBuffers | GPU worker model input preparation | ModelEngine input preparation |
+| kernel launch gap | ModelExecutor / CUDA graph wrapper | GPU worker / CUDA graph path | CUDA Graph |
+| output postprocess time | Generation OutputProcessor + AsyncLLM OutputProcessor + SMG parser | EngineCore/API Server output path | Sampler/output handling |
+| tool loop overhead | SMG MCP / external app | API/server/external app | serving/external app |
+| p95 ITL gap attribution | EventLoop overlap 是否覆盖 CPU work | EngineCore/API split + worker loop | Overlap Scheduler |
 
 ## 3. 相同问题二：Agent KV 管理如何处理
 
@@ -676,6 +794,119 @@ flowchart TB
 | host/DDR offload | 通用 KVStore/MemoryExecutor 路径存在；DSV4 当前不能计入 | V1 guide 显示 GPU <> CPU KV cache swapping removed；另有 connector/disagg mechanisms | host_cache_size 控制 host offload |
 | 外部可观测/路由 | SMG routing 可影响 worker locality；engine KV event 另需具体闭环 | KV events/connector docs存在；本文未深挖路由实现 | KV cache events 可用于外部 cache-aware routing/management |
 
+### 3.6 同一条 agent 请求的 KV 生命周期对照
+
+下面把 Round 1 / tool wait / Round 2 放到同一张生命周期图里。这里重点看 engine/executor 层如何处理 KV，而不是 tool parser 如何识别 JSON。
+
+```mermaid
+flowchart LR
+  A["Round 1 prefill<br/>system + tools + user"]
+  B["Round 1 decode<br/>tool_call tokens"]
+  C["Round 1 finish"]
+  D["Tool wait<br/>external execution"]
+  E["Round 2 prefill<br/>history + tool result"]
+  F["Round 2 decode<br/>final answer"]
+
+  A --> B --> C --> D --> E --> F
+
+  subgraph KQ["KV questions at each boundary"]
+    Q1["A: prefix match?"]
+    Q2["C: generated tokens enter reusable cache?"]
+    Q3["D: KV kept, evicted, offloaded, or just cached?"]
+    Q4["E: second request hits same worker/cache?"]
+    Q5["pressure: preempt/retract/offload/recompute?"]
+  end
+```
+
+| 生命周期阶段 | TokenSpeed | vLLM V1 | TensorRT-LLM |
+|---|---|---|---|
+| Round 1 prefill prefix lookup | C++ Scheduler 做 prefix match；必要时考虑 device/host depth 和 loadback diff，但 DSV4 host path 受限 | KVCacheManager `get_computed_blocks()` 查 prefix cached blocks | KVCacheManager 做 KV reuse；共享边界受 cache salt / request identity 等配置影响 |
+| Round 1 prefill 新 KV 写入 | `ForwardOp` 经 ModelExecutor 写 `token_to_kv_pool`，logical pages 由 Scheduler ownership 管 | scheduler 分配 slots，GPU worker 写 KV blocks | TensorRT engine 写 paged KV cache |
+| Round 1 decode tail / reserve | Scheduler 管 decode reserve；output feedback 用 `UpdateReserveNumTokens` 等事件推进 | scheduler 维护 running request 与 allocated blocks；spec/chunked prefill 等由 token budget 管 | Scheduler/CapacityScheduler 管 active request 资源；paged KV 随 executor step 更新 |
+| tool_call finish | Generation OutputProcessor 发 Finish/Extend 事件回 C++ Scheduler；SMG 解析 tool_call | request finished 后 KV manager 释放/缓存 blocks，API 层解析或返回 tool_call | request 完成后 response 返回，KV cache manager 可保留可复用 KV |
+| tool wait | 当前未看到 engine 内部专用 `ToolWait` 状态；通常是 request finish 后外部 tool 执行 | engine request 完成；外部 app/server 执行 tool | executor request 完成；外部 app/server 执行 tool |
+| wait 期间 device KV | prefix tree/cache policy 决定保留/释放/写回；DSV4 不应声称 DDR pause/resume | cached blocks 可留在 block pool/free queue，LRU eviction 时释放；V1 guide 不支持 GPU<>CPU swap | 可通过 host offload 延长 KV 存活，具体取决于 KVCacheConfig 和 eviction/offload policy |
+| Round 2 request routing | SMG routing 可影响是否回到相同 worker/cache locality | routing/serving 层决定是否回到有 cache 的 worker；本文未深挖 | KV event API 可服务外部 cache-aware routing；具体看部署 |
+| Round 2 prefix hit | 如果 prompt rendering 稳定且 worker/cache 命中，Scheduler prefix match 可减少 prefill | APC hash/block match 可减少 prefill | KV reuse 可减少重复 prefix compute |
+| KV pressure | retract/writeback/loadback 机制存在；DSV4 hierarchical path 当前不能计入 | LRU eviction、preemption/recompute、connector/disagg path | CapacityScheduler paused_requests、host offload、KV events |
+
+### 3.7 三框架 KV 状态迁移图
+
+这一张图用同一个抽象状态描述三者的 KV 生命周期差异。它不是源码状态名逐字映射，而是帮助报告读者看到“KV 从哪里来、到哪里去”。
+
+```mermaid
+stateDiagram-v2
+  [*] --> PromptTokens
+  PromptTokens --> PrefixLookup
+  PrefixLookup --> NewKVWrite: miss or partial hit
+  PrefixLookup --> ReuseKV: hit
+  NewKVWrite --> ActiveDecode
+  ReuseKV --> ActiveDecode
+  ActiveDecode --> FinishedRequest
+  FinishedRequest --> ReusableCache: cache retained
+  FinishedRequest --> Freed: no retention / evicted
+  ReusableCache --> Round2PrefixHit
+  ReusableCache --> Evicted: pressure
+  ReusableCache --> Offloaded: host/offload path
+  Offloaded --> Reloaded: later reuse
+  Reloaded --> Round2PrefixHit
+  Evicted --> Recompute
+  Freed --> Recompute
+```
+
+| 抽象状态 | TokenSpeed 对应 | vLLM V1 对应 | TensorRT-LLM 对应 |
+|---|---|---|---|
+| `PrefixLookup` | `KVPrefixCache.Match()` / hybrid prefix match | `get_computed_blocks()` | KV cache reuse lookup |
+| `NewKVWrite` | `ForwardOp` + `req_to_page` + `out_cache_loc` 写 `token_to_kv_pool` | `allocate_slots()` 后 GPU worker 写 blocks | TensorRT engine 写 paged KV |
+| `ActiveDecode` | `Decoding` FSM + decode reserve | running request + allocated blocks | active request in scheduler |
+| `FinishedRequest` | `FinishEvent` -> Draining/Finished | request finished -> `free()`/cache blocks | response complete in executor |
+| `ReusableCache` | prefix tree node resource / cached pages | block hash + cached blocks in block pool/free queue | reusable KV cache pages |
+| `Offloaded` | 通用 KVStore/MemoryExecutor path；DSV4 当前受限 | V1 guide 中 GPU<>CPU swap removed；external connector/disagg 另论 | host offload via `host_cache_size` |
+| `Round2PrefixHit` | Round 2 same prompt prefix + worker locality + prefix match | APC block hash hit | KV reuse hit / cache-aware routing |
+| `Recompute` | prefix miss 后 prefill recompute | prefix miss or preemption recompute | miss/eviction 后 recompute |
+
+这张图能澄清几个容易混淆的点：
+
+1. **tool wait 不是天然等于 KV pause。**
+   对三个框架来说，外部 tool 执行期间 engine request 通常已经完成；是否保留 KV 取决于 cache manager、routing、capacity、offload policy，而不是 tool_call 这个语义本身。
+
+2. **Round 2 是否受益取决于两个条件。**
+   prompt prefix 要稳定，且请求要命中含有可复用 KV 的 worker/cache。如果 gateway 每轮重新路由到不同 worker，engine prefix cache 能力会被削弱。
+
+3. **TokenSpeed 的 `ExecutionPlan` 差异是实现组织差异。**
+   它把 `ForwardOp + CacheOp` 放进同一轮 scheduler plan；这说明 cache movement 与 forward scheduling 有明确接口，但不自动说明真实 workload 下收益更高。
+
+4. **TensorRT-LLM 的 host offload 是文档明确能力。**
+   但这属于 NVIDIA runtime 下的 KVCacheConfig 能力；不能直接推断到 Ascend。
+
+5. **vLLM V1 不是弱 KV baseline。**
+   APC、BlockPool、Hybrid KV、connector/disaggregated prefill 都是已有架构元素。比较时不能把 vLLM 简化为“只有普通 paged cache”。
+
+### 3.8 KV 生命周期的待验证问题
+
+本文当前能回答“各自如何实现”，但还不能回答“哪个更有效”。要回答后者，至少需要这些事实：
+
+| 问题 | TokenSpeed 需要证明 | vLLM 需要对照 | TensorRT-LLM 需要对照 |
+|---|---|---|---|
+| Round 2 prefix hit | SMG prompt 稳定 + worker locality + Scheduler prefix match 是否稳定 | APC hash hit / cached token ratio | KV reuse hit / cache event/routing |
+| finish 后 KV retention | generated tokens 是否进入 prefix tree，保留多久 | blocks free 后是否仍可被 prefix cache 命中 | reusable KV pages retention / eviction |
+| tool wait cache 存活 | tool wait 长度增加时 KV 是否被 eviction/retract | LRU/free queue 行为 | host offload / priority eviction 行为 |
+| KV pressure | retract/writeback 是否比 recompute 更好；DSV4 path 是否可用 | preemption/recompute cost | CapacityScheduler pause/offload cost |
+| routing locality | SMG routing 是否让同 conversation 回到同 worker | serving/router 是否 cache-aware | KV events 是否接入 cache-aware router |
+| p95 TTFT/ITL | prefix reuse + EventLoop overlap 是否移动尾延迟 | EngineCore/APC 是否移动同一指标 | Overlap Scheduler/offload 是否移动同一指标 |
+
+### 3.9 证据索引：阶段到材料
+
+| 对照阶段 | TokenSpeed 本地证据 | vLLM 公开证据 | TensorRT-LLM 公开证据 |
+|---|---|---|---|
+| 整体进程/组件 | `01-runtime-architecture.md`、`python/tokenspeed/runtime/engine/*`、`tokenspeed-scheduler/csrc/*` | Architecture Overview 的 process architecture | Architecture Overview 的 LLM / PyExecutor / backend loop |
+| tool/parser 边界 | `07-smg-gateway-runtime.md`、`02-request-lifecycle.md` 中 T0/T0.5 | API server / serving 层资料；本文未把 tool parser 归入 EngineCore | LLM API / serving 层资料；Executor API 不执行外部 tool |
+| CPU 控制面 | `event_loop.py`、`request_handler.py`、`generation_output_processor.py`、`async_llm.py` | Architecture Overview、V1 Guide、V1 blog 对 CPU overhead / EngineCore 的描述 | Architecture Overview、Executor API、Overlap Scheduler 描述 |
+| prefix cache | `tokenspeed-scheduler/csrc/resource/kv_prefix_cache/*`、`03-agent-kv-management.md` | Automatic Prefix Caching | KV Cache System / KV cache reuse docs |
+| KV block/page ownership | `owned_pages.*`、`kv_allocator.*`、`forward_states.h` | KVCacheBlock / BlockPool / KVCacheManager 文档 | KVCacheManager / KVCacheConfig 文档 |
+| KV offload / pressure | `MemoryExecutor`、`KVStore`、`03` 中 DSV4 限制 | V1 Guide、disaggregated prefill / connector 文档 | KV Cache System 中 host offload，Scheduler 中 CapacityScheduler |
+| Round 2 routing locality | `07-smg-gateway-runtime.md` 的 routing policy 分析 | 本文未深挖 vLLM router | KV cache events / cache-aware routing 相关官方博客和文档 |
+
 ## 4. 当前文档可支持的客观观察
 
 以下不是竞争力结论，只是从架构图得到的差异描述：
@@ -702,16 +933,19 @@ flowchart TB
 1. **三框架整体架构图**
    一页三列：TokenSpeed / vLLM V1 / TensorRT-LLM，标出 gateway/API、scheduler loop、KV manager、GPU execution 的边界。
 
-2. **同一问题：agent CPU 高负载**
-   用一张公共问题图说明 CPU overhead 来源，再用三张小图说明三者如何拆分 control plane 和 GPU forward。
+2. **同一条 agent 请求的系统边界**
+   用 `messages + tools -> tool_call -> tool result -> Round 2` 串起 gateway/API、engine/executor、GPU forward、parser/tool runtime。
 
-3. **同一问题：agent KV 管理**
-   用一张 multi-turn tool loop 图说明 repeated prefix，再画三者 KV manager 的实现路径。
+3. **同一问题：agent CPU 高负载**
+   用一张公共问题图说明 CPU overhead 来源，再用阶段表说明三者在 template/tokenize、admission、scheduler step、GPU launch、output/parser、tool wait 的实现位置。
 
-4. **事实对照表，而非结论表**
+4. **同一问题：agent KV 管理**
+   用一张 multi-turn tool loop 图说明 repeated prefix，再用生命周期表对比 Round 1 prefill、tool_call finish、tool wait、Round 2 prefix hit、KV pressure。
+
+5. **事实对照表，而非结论表**
    表头用“组件边界 / 状态所有权 / offload 支持 / tool call 边界 / 未验证项”，不要用“强/弱/结论”。
 
-5. **最后只列开放问题**
+6. **最后只列开放问题**
    例如：真实 CPU time breakdown、prefix hit under tool loop、worker locality、DSV4 hierarchical KVStore 是否可落地、Ascend 上 MoE dispatch-combine 等价实现。
 
 ## 6. 外部资料索引
