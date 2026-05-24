@@ -8,7 +8,7 @@
 
 此前提交的版本过于像英文摘要，缺少系统架构、请求流、KV 生命周期和并行执行协议的展开。这一版重新按“技术解读”组织：先讲 TokenSpeed 是什么样的运行时系统，再用一条请求在系统内的流动把 SMG gateway、Scheduler/KV、并行策略、placement compiler 和性能收益挂起来。
 
-## 一句话结论
+## 一句话架构描述
 
 TokenSpeed 不应被理解成“带 C++ scheduler 和 MLA kernel 的 vLLM 类 serving 后端”。更准确的理解是：
 
@@ -18,7 +18,7 @@ KV page ownership、cache movement、模型层并行拓扑和 GPU forward
 物化连接成闭环的推理运行时系统。
 ```
 
-它最值得研究的地方不是单点功能，而是几个运行时协议是否形成了架构级优势：
+它最值得研究的地方不是单点功能，而是几个运行时协议如何形成系统级实现差异：
 
 - C++ Scheduler 把 request FSM 和 KV page ownership 绑在一起；
 - Python EventLoop 把 cache op、forward op、output feedback 串成可 overlap 的执行闭环；
@@ -60,8 +60,8 @@ KV page ownership、cache movement、模型层并行拓扑和 GPU forward
 4. [并行策略 / Placement Compiler 深挖](04-parallel-strategy-and-placement.md)  
    解释 split parallelism 不是 CLI 参数堆叠，而是如何落到 Mapping、process group、CommManager、placement compiler 和模型 forward。
 
-5. [架构竞争力横向分析](05-architecture-competitiveness.md)
-   横向对比 TokenSpeed、vLLM V1、TensorRT-LLM 的整体架构、agent CPU 控制面、KV 管理能力，再回到 TokenSpeed 内部机制判断 Scheduler/KV、EventLoop、split parallelism 和 placement compiler 是否构成架构级竞争力。
+5. [架构与实现客观对照](05-architecture-comparison.md)
+   横向对比 TokenSpeed、vLLM V1、TensorRT-LLM 的整体架构、agent CPU 控制面和 KV 管理实现，用架构图与实现路径说明三者如何处理同一类问题，不提前给出竞争力结论。
 
 6. [代码地图与未闭合问题](06-code-map-and-open-questions.md)  
    列出当前已经读过的源码入口、已经确认的判断边界，以及下一步还需要继续验证的关键问题。
@@ -69,7 +69,7 @@ KV page ownership、cache movement、模型层并行拓扑和 GPU forward
 7. [SMG Gateway 技术拆解](07-smg-gateway-runtime.md)
    单独拆解 SMG 的进程边界、gateway request pipeline、tool/reasoning parser、MCP tool loop、worker routing，以及它和 TokenSpeed engine 的职责切分。
 
-## 当前判断边界
+## 当前事实边界
 
 为了避免技术判断过度包装，当前结论保留这些边界：
 
@@ -85,8 +85,8 @@ KV page ownership、cache movement、模型层并行拓扑和 GPU forward
 - **不应声称 DeepSeek V4 已完全走 generic placement compiler。**  
   DeepSeek V4 当前实际路径更像手写模型逻辑 + `CommManager` + 自定义 attention/MoE；placement compiler 是通用基础设施，不能直接等同于 V4 主路径。
 
-- **不应把 MLA kernel 作为最大护城河。**  
-  vLLM 主线已经有 MLA / DeepSeek V4 相关 KV cache spec 与 runtime 支持，单 kernel 的护城河下降；仍有价值的是端到端 latent-KV execution、metadata、layout、prefill/decode 切换与 runtime 物化。
+- **不应把 MLA kernel 作为最大差异点。**
+  vLLM 主线已经有 MLA / DeepSeek V4 相关 KV cache spec 与 runtime 支持，单 kernel 的差异会被快速吸收；仍值得分析的是端到端 latent-KV execution、metadata、layout、prefill/decode 切换与 runtime 物化。
 
 ## 技术解读主线
 
@@ -102,7 +102,7 @@ KV page ownership、cache movement、模型层并行拓扑和 GPU forward
 2. **请求流：一条消息如何在 TokenSpeed 中执行**  
    展示 admission、ExecutionPlan、CacheOp、ForwardOp、OutputProcessor、scheduler.advance 的闭环。
 
-3. **Agent Runtime / KV Ownership：为什么它可能是最大护城河**  
+3. **Agent Runtime / KV Ownership：机制如何随请求状态迁移**
    用 request FSM 状态表讲清楚 page ownership 如何随 Submitted / Prefilling / Decoding / Draining / Retracting / Finished 迁移。
 
 4. **并行策略：不是支持 EP，而是不同 layer family 的 execution domain**  

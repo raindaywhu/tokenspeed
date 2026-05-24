@@ -153,7 +153,7 @@ C++ Scheduler 是 TokenSpeed KV 和请求生命周期的核心。Python worker �
 - `HybridPrefixCache`：KV prefix cache 与 Mamba cache 的组合能力。
 - `paged_cache_groups`：支持 full-history / sliding-window 等 paged cache group 表达。
 
-这个部分才是“Scheduler + KV ownership”护城河的中心。vLLM 要复制，不是加一个 backend 参数，而是要把 KV page lifetime 纳入 scheduler state transition。
+这个部分才是 `Scheduler + KV ownership` 架构差异的中心。若其他框架要做等价实现，重点不是加一个 backend 参数，而是把 KV page lifetime 纳入 scheduler state transition。
 
 ### 2.5 GPU Execution Plane
 
@@ -360,7 +360,7 @@ TokenSpeed 的优化点要对应这些具体问题：
 2. `02-request-lifecycle.md`：以一条 generate 请求为线索讲清楚上下文如何在系统内流动。
 3. `03-agent-kv-management.md`：Scheduler/KV/EventLoop 如何服务 agent 场景。
 4. `04-parallel-strategy-and-placement.md`：并行策略、Mapping、CommManager、placement compiler 和 DeepSeek V4 实际路径。
-5. `05-architecture-competitiveness.md`：把机制转成架构竞争力和性能归因判断。
+5. `05-architecture-comparison.md`：用三框架架构图与实现路径客观对照 agent CPU 控制面和 KV 管理问题。
 6. `06-code-map-and-open-questions.md`：已读代码、判断边界和未闭合问题。
 
 之前的 4+1 草稿可以作为中间材料，但不应再作为架构主依据；正式解读应以本文的 runtime boundary view 和请求生命周期图为主。
