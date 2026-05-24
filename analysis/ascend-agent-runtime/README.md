@@ -60,8 +60,8 @@ KV page ownership、cache movement、模型层并行拓扑和 GPU forward
 4. [并行策略 / Placement Compiler 深挖](04-parallel-strategy-and-placement.md)  
    解释 split parallelism 不是 CLI 参数堆叠，而是如何落到 Mapping、process group、CommManager、placement compiler 和模型 forward。
 
-5. [架构竞争力与性能归因](05-architecture-competitiveness.md)
-   从 SMG、Scheduler/KV、EventLoop、split parallelism、placement compiler 和 MLA/kernel 六个角度判断 TokenSpeed 是否真的有架构竞争力，以及 vLLM/vLLM-Ascend 的复制难度。
+5. [架构竞争力横向分析](05-architecture-competitiveness.md)
+   横向对比 TokenSpeed、vLLM V1、TensorRT-LLM 的整体架构、agent CPU 控制面、KV 管理能力，再回到 TokenSpeed 内部机制判断 Scheduler/KV、EventLoop、split parallelism 和 placement compiler 是否构成架构级竞争力。
 
 6. [代码地图与未闭合问题](06-code-map-and-open-questions.md)  
    列出当前已经读过的源码入口、已经确认的判断边界，以及下一步还需要继续验证的关键问题。

@@ -1,390 +1,653 @@
-# TokenSpeed 架构竞争力与性能归因 v0.3
+# TokenSpeed 架构竞争力横向分析 v0.4
 
 更新时间：2026-05-24
 
-本篇不写 benchmark 执行计划。它服务于一个更前置的问题：
+本篇不做 benchmark 计划，而是围绕架构竞争力做横向分析。对比对象收敛为三个：
+
+- TokenSpeed + SMG：基于本仓源码和前面几章分析；
+- vLLM / vLLM-Ascend：基于 vLLM V1 官方架构、scheduler、KV cache 文档；
+- TensorRT-LLM：基于 NVIDIA 官方 Executor、scheduler、KV cache 文档。
+
+分析框架也收敛为三个问题：
 
 ```text
-TokenSpeed 的架构设计是否真的有竞争力？
-这种竞争力来自哪些系统机制？
-vLLM / vLLM-Ascend 是容易复制，还是需要架构级重构？
+1. 三个框架的整体架构实现有什么差异？
+2. 对 agent workload 的 CPU 高负载问题，架构是否能有效解决？
+3. 对 agent workload 的 KV 管理问题，架构是否能有效解决？
 ```
 
-因此，本篇的重点不是“怎么测”，而是把前面几章的源码分析转成架构判断：
+最后再回答：TokenSpeed 是否真的有明显竞争力，还是只是实现风格不同。
 
-- 这个机制解决了 agentic MoE serving 的什么系统问题？
-- 它是否真的区别于通用 serving 后端？
-- 如果 vLLM 要复制，是配置、模型 patch、gateway runtime，还是 engine architecture？
-- 它可能改善哪类性能瓶颈，为什么不能线性相加？
+## 1. 整体架构实现对比
 
-## 1. 判断前提：目标不是普通 serving
+### 1.1 TokenSpeed：SMG gateway + TokenSpeed engine
 
-TokenSpeed 是否有竞争力，不能放在普通单轮吞吐场景里判断。它瞄准的更像 V4/Kimi 类 MoE + agentic workload：
+TokenSpeed 当前应理解为两层系统：
 
-| Workload 特征 | 系统压力 |
-|---|---|
-| 长 system prompt / tool schema / history prefix | repeated prefix 大，TTFT 受 prefix reuse 影响 |
-| 多轮 agent session | finish 后生成内容能否安全进入后续 prefix |
-| 短 decode step | CPU scheduler / output commit / collective launch 被放大 |
-| tool call / structured output / abort | request churn 高，finish/abort 资源释放必须及时 |
-| MoE + EP / TP | token dispatch、all-to-all、expert balance 成为瓶颈 |
-| latent-KV / compressed attention | KV layout、metadata、cache slot 映射影响 decode |
-| 多 DP replica | session KV footprint 和 rank token count 容易 skew |
-| p95/p99 敏感 | 平均 tokens/s 不足以代表体验 |
+```text
+SMG Gateway
+  OpenAI protocol / chat template / tokenizer cache /
+  tool parser / reasoning parser / MCP tool loop / worker routing
 
-所以，TokenSpeed 的竞争力不能只问 “某个 kernel 快不快”，而要问它是否把这些压力点纳入同一个 runtime 设计。
+TokenSpeed Engine
+  AsyncLLM / EventLoop / C++ Scheduler /
+  KV ownership / MemoryExecutor / ModelExecutor /
+  Mapping / CommManager / model forward
+```
 
-## 2. 架构竞争力总览
+这个架构的特点是：
 
-当前源码分析后，可以把 TokenSpeed + SMG 的竞争力拆成五层：
+1. **Gateway 和 engine 边界清楚**
+   `--tool-call-parser`、chat template、MCP tool loop、worker routing 在 SMG；engine 看到的是 tokenized generate request 和 sampling constraints。
 
-| 架构层 | TokenSpeed / SMG 的实现特征 | 解决的问题 | 竞争力判断 |
+2. **Scheduler/KV 是 engine 内部协议**
+   TokenSpeed 不是把 KV cache 当成外部插件，而是用 C++ Scheduler 管 request FSM、prefix tree、OwnedPages、tail page、reserve、finish insert、retract/recovery。
+
+3. **执行 loop 保持 Python 灵活性**
+   ModelExecutor 和模型 forward 仍在 Python/PyTorch 侧，C++ 主要承担 Scheduler/KV 生命周期。这个选择比纯 C++ runtime 更灵活，但也意味着 CPU overhead 不会天然低于 TensorRT-LLM。
+
+4. **模型并行进入模型层协议**
+   attention/dense/MoE 分别有 Mapping 和 process group，DeepSeek V4 走手写模型逻辑 + CommManager，而不是单一 TP/DP 组。
+
+所以 TokenSpeed 的架构假设是：
+
+```text
+用 SMG 稳定 agent 请求入口；
+用 C++ Scheduler/KV 处理 request 生命周期和 page ownership；
+用 Python execution plane 保持模型实现和并行策略灵活性。
+```
+
+### 1.2 vLLM V1：API server / EngineCore / GPU worker 多进程架构
+
+vLLM V1 官方文档把架构拆成：
+
+- API server process：处理 HTTP、input processing、tokenization、多模态 loading、streaming；
+- Engine Core process：运行 scheduler、管理 KV cache、协调 GPU worker；
+- GPU worker process：加载模型、执行 forward、管理 GPU memory；
+- DP coordinator：在 data parallel 时做 DP load balancing 和同步 forward。
+
+官方说明 vLLM V1 使用多进程架构来分离职责和提高吞吐，Engine Core 是一个 busy loop，持续调度请求并 dispatch 到 GPU worker。见 vLLM [Architecture Overview](https://docs.vllm.ai/en/stable/design/arch_overview/)。
+
+vLLM V1 的另一个关键点是 unified scheduler：它把 prompt tokens 和 output tokens 统一成 `{request_id: num_tokens}` 这样的 token budget 表达，用同一个 scheduling model 覆盖 chunked prefill、prefix caching、speculative decoding。见 vLLM [V1 Guide](https://docs.vllm.ai/en/stable/usage/v1_guide/)。
+
+这说明 vLLM 不是“简单 Python scheduler”。它已经在 V1 中专门重构了 CPU control plane、EngineCore、KV manager 和 worker 边界。
+
+### 1.3 TensorRT-LLM：C++ Executor / in-flight batching / engine-first runtime
+
+TensorRT-LLM 的架构更偏 backend/runtime：
+
+- Model Definition API 把模型构造成可编译的 TensorRT engine；
+- C++ runtime / C++ backend 是推荐路径；
+- Executor API 支持 async request execution 和 in-flight batching；
+- PyExecutor / C++ backend loop 内部包含 Scheduler、KVCacheManager、ModelEngine、Sampler；
+- runtime optimization 包括 CUDA Graph、Overlap Scheduler、speculative decoding 等。
+
+官方 Executor API 文档说明 TensorRT-LLM 提供高层 C++ API，可异步执行请求并支持 in-flight batching。见 [Executor API](https://nvidia.github.io/TensorRT-LLM/advanced/executor.html)。官方架构文档也说明 C++ backend 实现 in-flight batching，是推荐 backend。见 [TensorRT-LLM Architecture Overview](https://nvidia.github.io/TensorRT-LLM/0.19.0/architecture/overview.html)。
+
+因此 TensorRT-LLM 的架构假设和 TokenSpeed 不同：
+
+```text
+把模型和 runtime 尽量编译/固化到高性能 NVIDIA backend；
+用 Executor + in-flight batching + CUDA Graph / Overlap Scheduler 压低 CPU/GPU 开销。
+```
+
+### 1.4 整体架构判断
+
+| 维度 | TokenSpeed | vLLM V1 | TensorRT-LLM |
 |---|---|---|---|
-| SMG gateway runtime | OpenAI protocol、chat template、tokenizer cache、tool/reasoning parser、MCP tool loop、worker routing | 让 agent 请求稳定进入 backend，并保持 prompt / routing / parser 一致 | 中等；单点容易复制，完整 gateway runtime 复制成本较高 |
-| Scheduler / KV ownership | C++ request FSM、OwnedPages、prefix tree、finish insert、retract/recovery | 多轮 prefix reuse、KV page pressure、finish/abort 生命周期 | 强；属于 runtime protocol，不是配置项 |
-| EventLoop / execution loop | cache op、forward op、output feedback 分离并 overlap | 短 decode step 下减少 CPU/GPU 间隙 | 强；需要改 engine 主循环 |
-| Split parallelism / model-runtime | attention/dense/MoE 三套 Mapping、process group、CommManager、token-aware comm | 不同 layer family 的最优并行形态不同 | 强；不是“支持 EP”，而是多 group execution protocol |
-| local-SPMD / placement compiler | placement annotation、静态插入 collective | 把手写通信规则系统化，降低多模型适配成本 | 中到强；DeepSeek V4 当前不是主路径，但工程价值大 |
+| 入口层 | SMG gateway，agent/tool/parser 能力较完整 | OpenAI API server，多进程 input/output 处理 | LLM API / Triton backend / Executor |
+| Scheduler 位置 | TokenSpeed engine 内，C++ FSM | EngineCore busy loop | Executor / PyExecutor / C++ runtime |
+| KV 管理 | C++ Scheduler + KV ownership + prefix tree | KVCacheManager + block pool + prefix cache | KVCacheManager + paged KV + reuse/offload/event API |
+| 执行层 | Python ModelExecutor + custom kernels/backend | GPU worker + PyTorch/custom kernels | TensorRT engine + C++ runtime |
+| CPU overhead 方向 | C++ Scheduler + EventLoop overlap | 多进程 EngineCore + persistent batch + CUDA graphs | C++ Executor + CUDA Graph + Overlap Scheduler |
+| 灵活性 | 高，模型实现留在 Python | 高，模型生态强 | 中，engine/backend 绑定更强 |
 
-这五层不是彼此独立的功能清单。真正的差异在组合：
+初步判断：
 
-```text
-SMG 保持 prompt/routing 稳定
-  -> Scheduler/KV 才有机会复用 prefix
-  -> EventLoop 降低短 decode 控制面间隙
-  -> split parallelism 减少不合适的 communication shape
-  -> MoE / latent-KV backend 才能把模型特性转成吞吐或尾延迟收益
-```
+- TokenSpeed 在架构上不是 vLLM 的简单变体，但也不是全面领先。
+- vLLM V1 已经非常重视 CPU control plane 和 KV cache manager。
+- TensorRT-LLM 在 NVIDIA backend 上对 CPU overhead 和 runtime optimization 的工程成熟度更强。
+- TokenSpeed 的竞争力必须落到更具体的问题：agent short-decode 下的 CPU 高负载，以及多轮 prefix 下的 KV lifecycle。
 
-如果只复制其中一个点，收益会显著下降。
+## 2. Agent workload 问题一：CPU 高负载
 
-## 3. SMG：竞争力不在 parser，而在 gateway 一致性
+### 2.1 问题定义
 
-SMG 的 tool parser、reasoning parser 本身不是强护城河。单个 parser 可以被 vLLM 或任意 gateway 复制。
+Agent workload 的 CPU 高负载通常来自：
 
-SMG 的竞争力更准确地说是：它把 agent-facing 请求在进入 engine 前统一处理掉。
+- OpenAI protocol / messages / tools / chat template；
+- tokenization / detokenization / streaming；
+- structured output / tool parser；
+- 短 decode step 下 scheduler 每步频繁运行；
+- output feedback、stop 判断、abort/finish cleanup；
+- 多 DP / TP 场景下 metadata 同步和 worker dispatch；
+- tool loop 后下一轮 request 构造。
 
-它做了几件关键事情：
-
-- chat template 和 tokenizer 在 gateway 侧统一执行；
-- tokenizer L0/L1 cache 降低 repeated prompt 的 CPU 准备成本；
-- tool schema / tool_choice 被转换成 prompt 和 sampling constraint；
-- response 被解析成 OpenAI-compatible `tool_calls` / `reasoning_content`；
-- Responses API / MCP hosted tools 可以在 gateway 内部循环；
-- worker routing 可以在 backend admission 前决定请求落在哪个 worker。
-
-这解决的 workload 问题是：
+关键不是“CPU 使用率高”本身，而是 CPU 控制面是否拖住 GPU：
 
 ```text
-agent 请求不是裸 prompt，而是 messages + tools + history + tool result + parser state。
-如果 gateway 层不稳定，后端 KV cache 和 prefix reuse 很难稳定命中。
+decode step 越短，GPU forward 越快，
+CPU scheduler/output/parser 的固定开销越容易变成 p95 ITL。
 ```
 
-对 vLLM 的复制判断：
+### 2.2 TokenSpeed 如何处理
 
-- parser：model/gateway patch，可复制；
-- tokenizer cache：gateway runtime，可复制但需要系统化实现；
-- MCP tool loop：gateway runtime，可复制但要处理状态、持久化、parser 和下一轮 request 构造；
-- routing locality：router + backend 协议，需要知道 worker cache locality，复制难度上升。
+TokenSpeed 有三层应对：
 
-因此 SMG 不是最大护城河，但它是 TokenSpeed agent runtime 的入口条件。没有它，engine 的 KV reuse 和多轮稳定性收益会被削弱。
+1. **SMG 分担入口控制面**
+   SMG 处理 chat template、tokenizer cache、tool/reasoning parser、MCP tool loop。这样 engine 不需要理解 OpenAI messages/tools 原始结构。
 
-## 4. Scheduler / KV ownership：最强护城河候选
+2. **C++ Scheduler 承担 request/KV 决策**
+   admission、prefix match、page ownership、finish/retract 等高频状态逻辑在 C++ Scheduler 内，不是纯 Python 数据结构操作。
 
-TokenSpeed 的 Scheduler/KV 竞争力不应简化为“有 prefix cache”。真正重要的是：KV page ownership 被纳入 request FSM。
+3. **EventLoop overlap**
+   EventLoop 将 cache op、forward op、output feedback、scheduler.advance 串成闭环，当前 forward 可以和上一轮 output commit / cache state 更新错开。
 
-从源码路径看，C++ Scheduler 不是只决定下一批跑多少 token，而是同时管理：
+这套设计对 CPU 高负载有价值，尤其是短 decode、多轮 request churn 场景。但它不是天然碾压：模型 forward、input buffer、distributed metadata、部分 output processing 仍在 Python runtime 内。
 
-- request lifecycle；
-- prefix match；
-- active / cached page ownership；
+### 2.3 vLLM 如何处理
+
+vLLM V1 对 CPU overhead 的设计非常明确。vLLM 官方 V1 博客写到，GPU 变快后，API server、scheduler、input preparation、detokenization、streaming 的 CPU overhead 更明显；V1 通过 multiprocessing API server、隔离 EngineCore execution loop 来让 tokenization、多模态 processing、detokenization、streaming 与核心 scheduler/model executor overlap。见 [vLLM V1 blog](https://vllm.ai/blog/2025-01-27-v1-alpha-release)。
+
+vLLM V1 还提到：
+
+- simple unified scheduler 用 token budget 表达调度；
+- persistent batch 缓存 input tensors，只应用 step diff，减少每步重建 metadata；
+- prefix caching 数据结构降低 Python object 创建和 eviction 开销；
+- chunked prefill 默认优先 decode，在 token budget 允许时再放 prefill，以改善 ITL。见 vLLM [Optimization and Tuning](https://docs.vllm.ai/en/stable/configuration/optimization/)。
+
+所以，在 CPU 高负载问题上，vLLM V1 已经是强对手。TokenSpeed 不能只靠“有 C++ scheduler”就得出明显优势。
+
+### 2.4 TensorRT-LLM 如何处理
+
+TensorRT-LLM 对 CPU 高负载的处理更 backend-first：
+
+- C++ Executor API 支持 async execution 和 in-flight batching；
+- C++ backend 是推荐 serving backend；
+- CUDA Graph 减少 CPU-side kernel launch overhead；
+- Overlap Scheduler 将下一 step GPU work 提前启动，同时 CPU 处理上一 step 的 stop / response update。
+
+NVIDIA 官方架构文档明确说明 Overlap Scheduler 的策略是：不等 CPU 处理完第 n 步结果，就启动第 n+1 步 GPU work，从而把 CPU-bound latency 隐藏在 GPU computation 后面；该 scheduler 默认开启。见 TensorRT-LLM [Architecture Overview](https://nvidia.github.io/TensorRT-LLM/architecture/overview.html)。
+
+这意味着如果只看 CPU 高负载 / GPU idle gap，TensorRT-LLM 在 NVIDIA 平台上是非常强的 baseline。
+
+### 2.5 CPU 高负载横向结论
+
+| 框架 | 是否有效解决 CPU 高负载 | 判断 |
+|---|---|---|
+| TokenSpeed | 部分有效 | C++ Scheduler + EventLoop overlap 有价值，但 Python execution plane 仍存在 |
+| vLLM V1 | 有效 | V1 明确围绕 CPU overhead 重构 EngineCore、API server、persistent batch |
+| TensorRT-LLM | 很强 | C++ Executor、CUDA Graph、Overlap Scheduler 对 CPU/GPU gap 更直接 |
+
+结论：
+
+```text
+CPU 高负载不是 TokenSpeed 的绝对优势点。
+它有竞争力候选，但 vLLM V1 和 TensorRT-LLM 都已经系统性解决这个问题。
+TokenSpeed 只有在 C++ Scheduler/KV feedback 与 EventLoop overlap 组合
+显著降低 agent short-decode p95 时，才能说有差异。
+```
+
+因此报告里不应写：
+
+```text
+TokenSpeed 有 C++ Scheduler，所以 CPU overhead 显著优于 vLLM/TensorRT。
+```
+
+更合理的写法是：
+
+```text
+TokenSpeed 在 CPU control plane 上有明确设计，但横向看不是唯一有解。
+vLLM V1 也在降低 CPU overhead，TensorRT-LLM 在 NVIDIA backend 上更激进。
+TokenSpeed 的差异要和 KV lifecycle / output feedback 绑定起来看。
+```
+
+## 3. Agent workload 问题二：KV 管理
+
+### 3.1 问题定义
+
+Agent workload 的 KV 管理压力不是普通长上下文那么简单，而是：
+
+- 多轮 messages/tools/history 形成 repeated prefix；
+- tool call 后下一轮 request 需要复用前序上下文；
+- finish/abort 很频繁，KV block/page 生命周期复杂；
+- 短 decode 造成 tail page waste；
+- KV 接近满载时需要 preempt / retract / evict / offload；
+- 多 replica 时，KV locality 和 load balance 冲突；
+- host/device/offload cache 是否能被 scheduler 正确利用。
+
+关键问题是：
+
+```text
+KV 不只是 block cache，而是 request lifecycle 的一部分。
+谁拥有 page？什么时候能复用？什么时候该释放、回收、下沉、恢复？
+```
+
+### 3.2 TokenSpeed 如何处理
+
+TokenSpeed 的 KV 管理最值得研究。根据本地代码分析，它把 KV page ownership 放进 C++ Scheduler 的 request FSM：
+
+- prefix tree / safe reuse；
+- request-local tail page；
+- dynamic decode reserve；
+- finish insert；
+- retract / recovery；
+- cache op + forward op 同在 ExecutionPlan；
+- scheduler.advance 根据 output feedback 推进状态；
+- DP 场景下还会同步 global token / batch / mode metadata。
+
+这和“有 prefix cache”不是一回事。TokenSpeed 试图把：
+
+```text
+request state
+  + KV page ownership
+  + prefix tree
+  + cache movement
+  + output feedback
+```
+
+绑定成一个 runtime protocol。
+
+它的强点是安全复用和生命周期语义；弱点是当前 DeepSeek V4 path 明确禁用 hierarchical KVStore，不能把 host/L2/L3 offload 直接算作 V4 当前收益。
+
+### 3.3 vLLM 如何处理
+
+vLLM 的 KV 管理也很成熟。官方 prefix caching 设计说明，vLLM V1 的 prefix cache 实现在 KV cache manager 中，核心 `KVCacheBlock` 包含 immutable block id、block hash、ref count 和 free queue 指针；KV cache manager 初始化时预分配 block pool，并维护 free queue、hash key 到 block id、request id 到 block id 的映射。见 vLLM [Automatic Prefix Caching](https://docs.vllm.ai/en/v0.11.1/design/prefix_caching/)。
+
+vLLM 的调度路径中，scheduler 会调用：
+
+- `get_computed_blocks()` 查找已计算 prefix；
+- `allocate_slots()` 分配新 block、touch 已命中 block、从 free queue 分配或 evict；
+- running request 会 append token ids 到 slots，block full 后进入 cache。
+
+vLLM V1 的特点是 hash-based prefix cache + LRU eviction + block pool，且 V1 文档强调 prefix cache 低 overhead。vLLM 还有 Hybrid KV Cache Manager，用 KVCacheCoordinator 管理不同 KV cache group，例如 full attention + sliding window / Mamba 等组合。见 vLLM [Hybrid KV Cache Manager](https://docs.vllm.ai/en/stable/design/hybrid_kv_cache_manager/)。
+
+另外，vLLM 的 disaggregated prefill 通过 prefill instance、decode instance 和 KV connector 转移 KV cache，官方文档说明 connector / LookupBuffer / Pipe 是核心抽象。见 vLLM [Disaggregated Prefilling](https://docs.vllm.ai/en/v0.12.0/features/disagg_prefill/)。
+
+因此 vLLM 不是弱 KV baseline。它已经有：
+
+- paged KV；
+- block pool；
+- prefix cache；
+- hybrid KV group；
+- disaggregated prefill KV transfer；
+- preemption/recompute 策略；
+- KV event / connector 相关机制。
+
+TokenSpeed 如果要证明 KV 管理更强，不能只说“prefix cache”。它必须证明 request FSM + page ownership + finish/retract 语义更紧密。
+
+### 3.4 TensorRT-LLM 如何处理
+
+TensorRT-LLM 的 KV 管理同样很强，而且在一些方面比 TokenSpeed 当前落地更完整。
+
+官方 KV cache 文档说明 TensorRT-LLM 的 KV cache 支持跨请求 reuse，并提供 offloading、prioritized eviction 等工具来增加 reuse。见 TensorRT-LLM [KV Cache System](https://nvidia.github.io/TensorRT-LLM/features/kvcache.html)。
+
+TensorRT-LLM legacy KV cache reuse 文档说明：
+
+- KV cache pages 可以被相同 prompt 开头的请求共享；
+- reuse 可降低 first token latency；
+- KV cache reuse 默认可通过 KVCacheManager / `enableBlockReuse` 启用；
+- KV state 只有在计算该 state 的请求终止后才可复用；
+- reusable blocks 内存不足时按 LRU evict；
+- host memory offload 可以延长 reusable blocks 存活时间，但会引入 CPU/GPU copy 成本。见 [KV cache reuse](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/legacy/advanced/kv-cache-reuse.md)。
+
+更重要的是，TensorRT-LLM 还有 KV cache event API。NVIDIA 技术博客说明 Executor API 暴露 KV cache updates，block stored / removed / updated 时会发事件；这些事件可被单 executor 或多 executor 聚合，用于 KV-aware routing 和 scheduling。见 NVIDIA [KV cache reuse optimizations blog](https://developer.nvidia.com/blog/introducing-new-kv-cache-reuse-optimizations-in-nvidia-tensorrt-llm/)。
+
+TensorRT-LLM scheduler 文档也说明 CapacityScheduler 会根据 KV cache capacity 等资源决定哪些 active request 能被分配资源，并支持 paused_requests。见 TensorRT-LLM [Scheduler](https://nvidia.github.io/TensorRT-LLM/torch/scheduler.html)。
+
+这说明 TensorRT-LLM 在 KV 管理上不是只有 paged cache，而是有：
+
+- block reuse；
+- host offload；
+- priority retention / eviction；
+- KV event API；
+- KV-aware routing；
+- scheduler resource capacity 判断；
+- C++ runtime pause 支持。
+
+### 3.5 KV 管理横向结论
+
+| 框架 | KV 管理能力 | 对 agent 多轮 prefix 的适配性 | 判断 |
+|---|---|---|---|
+| TokenSpeed | request FSM + KV ownership + prefix tree + finish/retract | 理论上很贴合，但 V4 hierarchical KVStore 当前禁用 | 强候选，但不能夸大 |
+| vLLM V1 | block pool + hash prefix cache + scheduler allocation + hybrid KV manager | 成熟，生态强，APC 已系统化 | 强 baseline |
+| TensorRT-LLM | KV reuse + host offload + priority eviction + KV event API | 非常强，尤其适合 KV-aware routing/offload | 强 baseline，NVIDIA 平台优势明显 |
+
+结论：
+
+```text
+KV 管理是 TokenSpeed 最可能形成竞争力的方向，
+但不是因为“别人没有 KV cache”。
+vLLM 和 TensorRT-LLM 都有成熟 KV 管理。
+TokenSpeed 的差异只在于：它是否把 request FSM、KV ownership、
+finish/retract/recovery 和 execution plan 绑定得更深。
+```
+
+换句话说，TokenSpeed 的 KV 竞争力是“生命周期协议”竞争力，不是“缓存功能”竞争力。
+
+## 4. TokenSpeed 是否有明显竞争力
+
+### 4.1 不能成立的竞争力说法
+
+这些说法都不够严谨：
+
+```text
+TokenSpeed 有 C++ Scheduler，所以 CPU overhead 一定优于 vLLM。
+TokenSpeed 有 prefix cache，所以 agent 场景一定更强。
+TokenSpeed 有 SMG tool parser，所以 agent runtime 有护城河。
+TokenSpeed 有 MLA kernel，所以适配价值很高。
+TokenSpeed 支持 EP，所以 MoE serving 有优势。
+```
+
+横向看，这些单点都站不稳：
+
+- vLLM V1 也在系统性降低 CPU overhead；
+- TensorRT-LLM 在 C++ Executor、CUDA Graph、Overlap Scheduler 上更激进；
+- vLLM / TensorRT-LLM 都有成熟 KV cache / prefix reuse；
+- TensorRT-LLM 还有 host offload、priority eviction、KV event API；
+- parser 和 single kernel 都容易被复制或已经被吸收；
+- EP 本身不是优势，关键是 dispatch-combine 和 communication protocol。
+
+### 4.2 能成立的竞争力假设
+
+TokenSpeed 真正有竞争力的假设应该写成：
+
+```text
+对于 agentic MoE serving，
+TokenSpeed 的竞争力不来自单个功能，
+而来自 SMG gateway、C++ Scheduler/KV ownership、EventLoop feedback、
+split parallelism 和 model backend 的组合协议。
+```
+
+其中最值得保留的三条：
+
+1. **Scheduler / KV ownership**
+   如果 TokenSpeed 的 request FSM + page ownership 确实比 vLLM/TensorRT 更紧密地管理 finish/retract/recovery，那么它在多轮 prefix + KV pressure 场景有竞争力。
+
+2. **EventLoop 与 KV feedback**
+   如果 cache op / forward op / output feedback / scheduler.advance 的闭环能降低短 decode control-plane gap，那么它比普通 async output 更有价值。
+
+3. **split parallelism 作为 model-runtime 协议**
+   如果 attention/dense/MoE 不同 execution domain 真的减少了 communication 和 MoE token movement，那么它是 MoE serving 的竞争力候选。
+
+### 4.3 当前结论：局部有竞争力，但不是全面领先
+
+横向比较后，当前结论应更克制：
+
+| 问题 | TokenSpeed 相对 vLLM | TokenSpeed 相对 TensorRT-LLM | 结论 |
+|---|---|---|---|
+| 整体架构 | 更强调 C++ Scheduler/KV + Python model flexibility；vLLM V1 架构也很成熟 | 更灵活，但 backend 优化不如 TensorRT-LLM 固化 | 不是全面领先 |
+| CPU 高负载 | vLLM V1 已做 EngineCore、多进程、persistent batch，TokenSpeed 优势不明显 | TensorRT-LLM C++ Executor + Overlap Scheduler 更强 | TokenSpeed 不构成明显优势 |
+| KV 管理 | TokenSpeed lifecycle 语义可能更深，但 vLLM KV manager 很成熟 | TensorRT-LLM reuse/offload/event API 很强 | TokenSpeed 是强候选，但需谨慎 |
+| Agent gateway | SMG 比普通 backend 更贴近 agent tool loop | TensorRT-LLM 更偏 engine/backend，不是 gateway runtime | TokenSpeed 有中等优势 |
+| 并行策略 | TokenSpeed layer-family split 更值得研究 | TensorRT-LLM backend/MoE 优化强，但硬件绑定 | TokenSpeed 在架构表达上有候选优势 |
+
+最终判断：
+
+```text
+TokenSpeed 不是在所有维度明显强于 vLLM/TensorRT-LLM。
+在 CPU 高负载问题上，它不是明显领先者；
+在 KV 管理问题上，它有架构级竞争力候选；
+在 agent gateway + KV lifecycle + split parallelism 组合上，
+它可能形成区别于 vLLM/TensorRT-LLM 的系统性价值。
+```
+
+因此报告的表述应该是：
+
+```text
+TokenSpeed 值得研究，不是因为它有别人没有的单点功能，
+而是因为它试图把 agent gateway、request FSM、KV ownership、
+short-decode execution loop 和 MoE split execution domain 绑成一个 runtime。
+
+但横向看，vLLM V1 和 TensorRT-LLM 已经分别在 CPU overhead 和 KV cache 上很强。
+TokenSpeed 的竞争力应被定义为“局部架构竞争力候选”，
+核心看 Scheduler/KV lifecycle 与并行 execution protocol 是否能形成不可小 patch 复制的差异。
+```
+
+## 5. TokenSpeed 内部机制回填
+
+横向对比容易把 TokenSpeed 讲薄，因为 vLLM 和 TensorRT-LLM 都能列出类似功能名：prefix cache、paged KV、scheduler、EP、CUDA graph、overlap。真正要判断 TokenSpeed 是否有竞争力，必须回到它自己的实现耦合方式。
+
+### 5.1 Scheduler/KV ownership：不是 cache feature，而是 request lifecycle protocol
+
+TokenSpeed 的关键不是“它有 KV cache”，而是 C++ Scheduler 在一次 `schedule -> cache op -> forward op -> output feedback -> advance` 闭环里同时管理 request 状态和 KV page ownership。
+
+从前面源码分析看，Scheduler 不只是决定下一批请求跑多少 token，还同时处理：
+
+- prefix tree match；
+- request active page 和 cached page 的归属；
 - request-local tail page；
 - decode reserve；
-- finish 后插入 prefix tree；
-- retract / recovery；
-- abort / finish 资源释放；
-- scheduler.advance 之后的 page 状态反馈。
+- finish 后把生成内容插回 prefix tree；
+- abort/finish/retract/recovery 对 page 的释放或恢复；
+- scheduler.advance 根据 output feedback 推进 request 状态；
+- ExecutionPlan 同时携带 cache movement 和 forward metadata。
 
-这解决的是 agentic workload 的核心问题：
+这意味着 TokenSpeed 的 KV 管理更像一套生命周期协议：
 
 ```text
-多轮请求频繁 finish / resume / abort，KV 既要能复用，又不能被错误复用。
-安全复用比“缓存命中”这个口号更难。
+Request FSM
+  -> Prefix match
+  -> Page ownership
+  -> Cache operation
+  -> Forward operation
+  -> Output feedback
+  -> Finish / retract / recovery
+  -> Prefix tree update
 ```
 
-为什么它可能有竞争力：
+这个设计解决的是 agent workload 下最容易被低估的问题：请求不是稳定的一条长序列，而是频繁 finish、tool call、下一轮 resume、abort、重入。KV page 如果只是被当成 block pool，很容易把“能不能复用”简化成 hash 命中；但实际更难的是“什么时候可以安全复用，什么时候必须释放，什么时候可以恢复”。
 
-1. **生命周期语义深**
-   KV page 不是普通 block cache，而是随着 request FSM 在 submitted / prefilling / decoding / draining / finished / retracting 状态间转移。
+对 vLLM 的复制判断也要因此更细：
 
-2. **收益主要体现在尾部稳定性**
-   request-local tail page、reserve、retract/recovery 不一定显著提高平均吞吐，但会减少高并发短 decode 下的 page stall 和 queue 抖动。
+| 复制层级 | 难度 | 说明 |
+|---|---|---|
+| prefix hash / block pool | 低到中 | vLLM 已经有成熟 APC，不是 TokenSpeed 独有 |
+| finish 后复用生成内容 | 中 | 需要保证 output feedback 与 cache 状态一致 |
+| request FSM + page ownership 一体化 | 高 | 需要改 scheduler/KV manager 的状态边界 |
+| retract/recovery 与 execution plan 绑定 | 高 | 不只是 cache eviction，而是运行时状态恢复 |
 
-3. **复制需要改 scheduler 内核**
-   vLLM 可以有 prefix cache，但要复制这一整套 ownership 协议，不能只加配置或外部插件。
-
-性能影响的合理归因是：
-
-- repeated prefix 多时，`TTFT` 应下降，因为 prefill tokens saved 增加；
-- KV 接近满载时，p95/p99 queue stall 应下降，因为 page ownership 和 recovery 更细；
-- request churn 高时，abort/finish 释放更及时，减少无效占用；
-- 短 decode 高并发时，tail page waste 和 reserve waste 降低，p95 ITL 更稳定。
-
-需要注意的边界：
-
-- 当前没有看到 tool-call-specific DDR KV offload；
-- DeepSeek V4 hierarchical KVStore 短期不能算作已落地收益；
-- tool loop 的下一轮 request 是 SMG 发起，不是 engine 内部 pause/resume。
-
-## 5. EventLoop：短 decode 场景的系统收益
-
-Agent workload 常见模式是：
+所以，TokenSpeed 在 KV 方向的竞争力必须这样表述：
 
 ```text
-long prefill once
-  -> many short decode steps
+不是“TokenSpeed 有 prefix cache”，而是“TokenSpeed 试图把 prefix reuse、
+page ownership、finish/retract/recovery 变成 scheduler 的一等语义”。
+```
+
+### 5.2 EventLoop：短 decode 场景的控制面闭环
+
+Agent workload 常见形态是：
+
+```text
+long prefill
+  -> short decode
   -> tool call
-  -> next short response
+  -> append tool result
+  -> next short decode
 ```
 
-短 decode step 下，每步 token 很少，kernel 本身未必是唯一瓶颈。CPU scheduler、output D2H、postprocess、下一轮 admission 和 distributed metadata 同步都可能变成 p95 ITL 的来源。
+短 decode step 下，单步 GPU forward 可能很快，CPU 侧的 scheduler、output processing、stop 判断、metadata 更新、下一步 batch 构造反而会暴露出来。TokenSpeed 的 EventLoop 价值在于它不是把这些动作串成一个单线程同步路径，而是把 cache operation、forward operation、output feedback 和 scheduler.advance 拆开形成闭环。
 
-TokenSpeed 的 EventLoop 竞争力在于它把几个动作拆开：
+这类设计影响的不是一个单独 kernel，而是 p95 ITL：
 
-- scheduler 产出 ExecutionPlan；
-- MemoryExecutor 执行 cache op；
-- ModelExecutor 执行 forward op；
-- OutputProcessor 消费上一轮 output；
-- scheduler.advance 用 output 反馈推进 request FSM；
-- DP 场景下 forward 前同步各 rank token / batch / mode metadata；
-- idle rank 也能参与必要 collective，保证 distributed progress。
+- 当前 step 的 forward 可以和上一轮 output commit / state advance 有机会错开；
+- cache op 和 forward op 同在 ExecutionPlan，KV movement 不再是 executor 外部副作用；
+- output feedback 不是最终日志，而会反向推进 Scheduler 的 request FSM；
+- DP 下还要同步 global token / batch / mode metadata，避免 idle rank 破坏 collective progress。
 
-这解决的是：
+对比 vLLM 和 TensorRT-LLM时，这个点不能被夸大。vLLM V1 已经有 EngineCore busy loop、persistent batch 和 async output processing；TensorRT-LLM 的 Overlap Scheduler 在 NVIDIA 平台上更直接地隐藏 CPU stop/response update。TokenSpeed 的差异只在于：它的 EventLoop 是否和 KV ownership / ExecutionPlan 绑定得更深。
+
+因此可以给出一个更精确的判断：
 
 ```text
-decode 每步太短，控制面开销无法被大 batch 计算掩盖。
+如果 workload 主要是大 batch 长 decode，TokenSpeed EventLoop 未必明显领先；
+如果 workload 是高 churn、多轮、短 decode、KV pressure，
+EventLoop + Scheduler/KV feedback 才可能移动 p95 ITL。
 ```
 
-对 vLLM 的复制判断：
+### 5.3 并行策略：不是支持 EP，而是 layer-family execution domain
 
-- 简单 async output processor 可以复制；
-- 真正复制 `cache op / forward op / output feedback / scheduler.advance` 的闭环，需要 engine 主循环重构；
-- DP idle forward、token-aware collective 和 CUDA graph shape 还要和模型执行层协同。
+并行策略这部分也容易讲浅。`--enable-expert-parallel`、`--data-parallel-size`、`--tensor-parallel-size` 这些能力本身各家都有，不能构成竞争力。TokenSpeed 值得研究的是它是否把不同 layer family 的最优并行形态明确拆开。
 
-性能上，它更可能改善：
-
-- p95 ITL；
-- GPU idle gap；
-- scheduler iteration overhead；
-- output commit latency；
-- 高并发短 decode 下的尾部抖动。
-
-这也是为什么单看平均 throughput 可能低估它的价值。
-
-## 6. 并行策略：不是支持 EP，而是多 execution domain
-
-并行策略是当前最需要讲清楚的部分。TokenSpeed 的特别之处不是“支持 EP/TP/DP”，而是它把不同 layer family 的并行域拆开：
+可以把它理解为：
 
 ```text
-Mapping
-  attention: tp / cp / dp
-  dense:     tp / dp
-  moe:       tp / ep / dp
+attention domain: latency-sensitive, head/KV layout-sensitive
+dense domain: GEMM throughput-sensitive
+MoE domain: expert placement, token dispatch, all-to-all-sensitive
+DP domain: request/session/KV locality-sensitive
 ```
 
-然后把这套 mapping 落到：
+如果这些 domain 被迫共用一个 TP/DP/EP 组合，就会出现结构性浪费：
 
-- process group；
-- weight sharding；
-- attention head / KV layout；
-- dense TP linear；
-- MoE expert placement；
-- `CommManager` 的 AR / all-gather / reduce-scatter 选择；
-- `ForwardContext.global_num_tokens` 的 token-aware communication；
-- MoE backend / all-to-all / grouped expert GEMM。
+- attention decode 本来 token 很少，被过度 TP 后通信延迟可能盖过计算收益；
+- dense/shared expert 可能需要 TP 分摊 GEMM；
+- routed MoE 更依赖 EP 和 dispatch-combine，而不是简单 dense TP；
+- 多 DP replica 下，rank token count 和 session KV footprint 会 skew，communication 不能假设各 rank token 一样。
 
-DeepSeek V4 推荐配置是最有说明力的例子：
+前面源码分析里，TokenSpeed 的 `Mapping`、process group、`CommManager`、MoE backend 和 placement compiler 都应该放在这个问题下讲，而不是各自散讲：
+
+| 实现点 | 应回答的问题 | 竞争力边界 |
+|---|---|---|
+| split Mapping | attention/dense/MoE 是否能用不同 group | 配置名容易复制，真正难点是贯穿模型 forward |
+| CommManager | hidden state 何时 AR/AG/RS，是否 token-aware | 需要和真实 token distribution、residual placement、CUDA graph shape 协同 |
+| MoE backend | expert weight、top-k token、dispatch-combine 如何组织 | 硬件绑定强，Ascend 迁移需要重做等价 backend |
+| placement compiler | 手写通信规则能否系统化 | 工程护城河大于当前 V4 直接性能收益 |
+
+这也是为什么并行策略不能写成“TokenSpeed 支持 EP”。更准确的说法是：
 
 ```text
---data-parallel-size 4
---enable-expert-parallel
---moe-backend mega_moe
+TokenSpeed 的并行策略竞争力候选在于：
+它试图把 attention、dense、MoE、DP/TP/EP 的 execution domain
+作为模型 runtime 协议表达，而不是只靠启动参数拼后端能力。
 ```
 
-按源码推导，实际 execution plan 更接近：
+但边界也必须保留：
+
+- 当前 DeepSeek V4 路径更像手写模型逻辑 + `CommManager` + 自定义 attention/MoE，不应说已完全依赖 generic placement compiler；
+- TokenSpeed 当前仍有限制，例如 MoE TP 和 EP 不能随意同时放大；
+- Ascend 上要复现这类收益，真正难点在 CANN/HCCL/自研 MoE dispatch-combine，而不是参数接口。
+
+### 5.4 local-SPMD / placement compiler：服务并行策略，不是独立卖点
+
+local-SPMD / placement compiler 在报告中的位置应该后移：它不是并行策略的全部，也不是 DeepSeek V4 当前主性能来源，而是让复杂并行策略可维护、可扩展的机制。
+
+它的工作原理可以讲成三层：
 
 ```text
-attention: tp=1, dp=4
-dense:     tp=4
-moe:       ep=4, tp=1
+Placement annotation
+  表达 tensor/module 边界上的 Replicate / Shard / Partial / ATTN_TP / DENSE_TP / MOE_TP_EP
+
+Static compiler
+  沿 decoder layer module spec 推导 placement 变化
+
+Collective insertion
+  在 placement 不匹配处插入 all-gather / reduce-scatter / all-reduce /
+  deferred reduce / residual slice / fused reduce-norm
 ```
 
-这说明 TokenSpeed 不认为 V4 attention、dense、MoE 应该共用同一种 TP。
-
-为什么这可能有竞争力：
-
-1. **attention 和 MoE 的瓶颈不同**
-   attention / latent-KV decode 小步更怕 head 切碎和通信延迟；MoE 更怕 expert 权重容量、token dispatch 和 all-to-all。
-
-2. **dense/shared expert 和 routed expert 的策略不同**
-   dense/shared expert 可用 TP 摊 GEMM；routed expert 更适合 EP 和专用 dispatch-combine。
-
-3. **短 decode 下 token skew 会放大通信浪费**
-   `CommManager` 用 token all-gather / reduce-scatter，而不是简单假设每 rank token 一样多。
-
-4. **隐藏状态 placement 被追踪**
-   attention 输出、MLP 输入、MoE 输出之间何时 replicate、shard、partial，不是靠模型作者临时拼通信。
-
-对 vLLM 的复制判断：
-
-- 增加 `--attn-tp-size` / `--moe-tp-size` 风格参数：config-level，容易；
-- 让不同 layer family 使用不同 process group：model-runtime，难度中等；
-- weight loader、attention layout、MoE backend 都读同一套 mapping：model-runtime，难度较高；
-- token-aware AR/RSAG、residual placement、idle rank progress、CUDA graph shape 协同：architecture-level，难；
-- Ascend 上还要重建 DeepEP / mega_moe 等价的 all-to-all 或 dispatch-combine backend，难度更高。
-
-边界也要写清楚：
-
-- TokenSpeed 当前禁止 MoE TP 和 EP 同时大于 1；
-- CP 目前不是成熟独立策略面；
-- DeepSeek V4 不是 generic placement compiler 主路径，而是手写模型逻辑 + `CommManager` + 自定义 V4 attention/MoE。
-
-## 7. local-SPMD / placement compiler：工程竞争力大于短期性能
-
-local-SPMD / placement compiler 不应该被包装成 DeepSeek V4 当前性能收益的主来源。它的价值在另一层：
+这解决的不是“某次 forward 更快一点”，而是：
 
 ```text
-并行策略是“怎么切”；
-placement compiler 是“如何把切分安全落到模型图里”。
+当模型越来越像 V4/Kimi：attention、dense、routed expert、shared expert、
+latent-KV、DP/TP/EP/CP 混在一起时，手写通信规则很难长期维护。
 ```
 
-它用轻量 placement 类型表达：
+对 vLLM 复制难度的判断：
 
-- `Replicate`
-- `Shard`
-- `Partial`
-- `ATTN_TP`
-- `DENSE_TP`
-- `MOE_TP_EP`
+- 如果只是支持更多 parallel size 参数：配置级复制；
+- 如果模型内部按 layer family 走不同 process group：model patch 级复制；
+- 如果 placement、weight loader、forward hidden-state movement、collective insertion 统一表达：架构级复制。
 
-然后静态分析 decoder layer 的 module spec，插入：
-
-- all-gather；
-- reduce-scatter；
-- all-reduce；
-- deferred reduce；
-- residual slice / residual gather；
-- fused reduce-norm。
-
-这解决的是复杂模型适配成本问题：
+所以 placement compiler 的价值应该写成：
 
 ```text
-每新增一个模型，如果都手写 CommManager 规则，很容易出错；
-placement compiler 可以把通信插入变成可复用协议。
+它不直接证明 TokenSpeed 当前更快；
+它证明 TokenSpeed 在复杂 MoE/latent-KV 并行策略上有系统化落地路径。
 ```
 
-对竞争力的判断：
+## 6. 性能归因账本
 
-- 直接性能收益不应高估；
-- 对 DeepSeek V4 当前主路径的归因要降权；
-- 对未来多模型、多并行策略、多硬件适配，工程价值较强；
-- vLLM 复制这个能力需要把 model graph、parallel mapping 和 collective insertion 放到同一个抽象里。
+这份报告仍然需要回答“这些设计会让哪些性能指标移动”。但写法应该是机制归因，而不是把多个百分比线性相加。
 
-## 8. MLA / latent-KV：不是最大护城河
-
-MLA / latent-KV execution 仍有价值，但不应成为报告主线。
-
-原因：
-
-- vLLM 已经吸收或支持 DeepSeek/MLA 相关算子路径；
-- 单个 kernel 很容易从护城河变成共享能力；
-- Blackwell/CUDA kernel 对 Ascend 不可直接迁移；
-- 对 910C/950DT 更有价值的是 layout、metadata、prefill/decode 切换、KV pack/quant、ragged prefill 的系统经验。
-
-合理定位是：
-
-```text
-MLA / latent-KV 是模型执行层的加分项；
-TokenSpeed 真正值得研究的是 runtime 是否能端到端承载 latent-KV execution。
-```
-
-如果收益只来自一个 kernel，那么更合理的路线是反哺 vLLM-Ascend；如果收益来自 Scheduler/KV + split parallelism + latent-KV metadata 的组合，才支持 TokenSpeed 适配价值。
-
-## 9. 竞争力矩阵
-
-| 能力 | 是否独特 | vLLM 复制难度 | 性能影响 | 当前判断 |
-|---|---|---|---|---|
-| SMG parser | 低 | 低 | correctness / tool compatibility | 不构成核心护城河 |
-| SMG gateway runtime | 中 | 中 | TTFT / agent loop latency / routing locality | 有入口价值 |
-| Scheduler/KV ownership | 高 | 高 | TTFT、p95 queue、p95 ITL 稳定性 | 核心护城河候选 |
-| EventLoop overlap | 高 | 高 | p95 ITL、GPU idle gap | 核心护城河候选 |
-| split Mapping | 中高 | 中高 | TPM/device、communication overhead | 核心护城河候选 |
-| CommManager token-aware comm | 高 | 高 | collective bytes、rank skew、p95 ITL | 核心护城河候选 |
-| placement compiler | 中 | 中高 | 直接性能有限，工程收益强 | 长期护城河候选 |
-| DeepSeek V4 mega_moe | 中 | 高但硬件绑定 | MoE throughput | Ascend 可迁移性受限 |
-| MLA kernel | 中低 | 中低 | decode throughput | 不应作为主护城河 |
-
-当前最强的三个竞争力候选是：
-
-1. Scheduler / KV ownership；
-2. split parallelism + token-aware communication；
-3. EventLoop 对短 decode 的执行闭环。
-
-SMG 是必要入口层，但不是最大护城河。placement compiler 是长期工程护城河候选。MLA/kernel execution 比重应降低。
-
-## 10. 性能收益如何写才不空
-
-报告里仍然需要讲性能影响，但写法应该是“机制改变瓶颈”，不是“预计提升 X%”。
-
-| 机制 | 改变的瓶颈 | 可能改善的指标 | 为什么 |
+| 机制 | 主要改变的瓶颈 | 应该移动的指标 | 为什么 |
 |---|---|---|---|
-| SMG tokenizer/cache | gateway prompt preparation | TTFT | repeated template/tokenization 不再每轮重做 |
-| SMG routing locality | worker cache locality / load skew | TTFT、queue p95 | 多轮 session 更可能命中同 worker cache |
-| Scheduler prefix reuse | repeated prefill compute | TTFT、prefill load | cached prefix 减少重复 prefill |
-| finish insert | 后续轮次可复用范围 | TTFT | 生成内容安全进入 prefix tree |
-| request-local tail page | KV page fragmentation | p95 queue、p95 ITL | 减少短 decode 尾页浪费 |
-| decode reserve | KV admission 稳定性 | p95 ITL | 避免 variable accepted tokens 造成 page 抖动 |
-| retract/recovery | KV 满载时的恢复成本 | p95/p99 queue | 用更细粒度恢复替代粗暴失败 |
-| EventLoop overlap | CPU/GPU 控制面间隙 | p95 ITL | output feedback 与下一轮 forward 重叠 |
-| split parallelism | 不合适的统一 TP/EP | TPM/device、comm time | attention/dense/MoE 分别选择 group |
-| token-aware RSAG | rank token skew / padding waste | p95 ITL、comm time | 按真实 token count 通信 |
-| MoE EP backend | expert capacity / dispatch-combine | TPM/device、MoE layer time | 专家权重和 token movement 更贴近 MoE 瓶颈 |
-| placement compiler | 复杂策略落地成本 | 工程迭代速度、bug rate | 静态插入通信，减少手写错误 |
+| SMG tokenizer/cache | gateway prompt preparation | TTFT、CPU time/request | repeated template/tokenization 不再每轮重做 |
+| SMG worker routing | worker KV locality / load skew | TTFT、queue p95、prefix hit | 多轮 session 更可能落到已有 cache 的 worker |
+| Scheduler prefix reuse | repeated prefill compute | TTFT、prefill tokens saved | cached prefix 减少重复 prefill |
+| finish insert | 下一轮可复用范围 | TTFT、prefix hit after tool loop | 生成内容安全进入 prefix tree |
+| request-local tail page | KV fragmentation | free page watermark、p95 queue | 短 decode 尾页浪费下降 |
+| decode reserve | KV admission 稳定性 | stall 次数、p95 ITL | accepted tokens 变化不至于造成 page 抖动 |
+| retract/recovery | KV 满载恢复成本 | p99 queue、recompute/offload 次数 | 比粗暴失败或全量重算更细粒度 |
+| EventLoop overlap | CPU/GPU control gap | GPU idle gap、p95 ITL | output feedback 与下一步执行重叠 |
+| split parallelism | 不合适的统一 TP/EP | collective bytes、MoE layer time | attention/dense/MoE 分别选 group |
+| token-aware communication | rank token skew / padding waste | per-rank token skew、comm time | 按真实 token count 通信 |
+| MoE EP backend | expert dispatch-combine | all-to-all bytes、expert GEMM util | 更贴近 routed expert 瓶颈 |
+| placement compiler | 并行策略实现成本 | 新模型适配周期、通信 bug | 静态插入 collective，减少手写规则 |
+| MLA / latent-KV | KV layout / decode memory bandwidth | decode kernel time、KV bandwidth | 价值在端到端 layout，不在单 kernel |
 
-更谨慎的结论是：
-
-```text
-TokenSpeed 的性能竞争力不是单项优化叠加，
-而是当 workload 同时具备 long-prefix、short-decode、MoE token skew、
-多轮 agent request 时，多个 runtime 协议共同减少无效 prefill、KV stall、
-CPU/GPU gap 和不必要通信。
-```
-
-## 11. 最终架构判断
-
-如果只看“是否支持 EP、是否有 MLA kernel、是否有 tool parser”，TokenSpeed 的差异并不大。
-
-如果从完整 agentic MoE serving runtime 看，TokenSpeed 的竞争力更明确：
+综合性能模型应写成瓶颈迁移：
 
 ```text
-它把 gateway 一致性、request FSM、KV ownership、EventLoop overlap、
-layer-family split parallelism、token-aware communication 和模型后端
-放进同一套执行协议里。
+如果 TTFT 主要来自重复 prefill，Scheduler prefix reuse / finish insert 更重要；
+如果 p95 ITL 主要来自 CPU/GPU gap，EventLoop / persistent batch / overlap scheduler 更重要；
+如果 MoE layer time 占比高，split parallelism / EP backend / dispatch-combine 更重要；
+如果 KV capacity 接近上限，page ownership / retract / offload / eviction 更重要。
 ```
 
-这套系统对 vLLM/vLLM-Ascend 的复制难点不在单点功能，而在协议耦合：
+因此不能写：
 
-- gateway routing 要服务 backend KV locality；
-- scheduler 要知道 page ownership 和 finish/retract 语义；
-- model forward 要知道 attention/dense/MoE 的不同 group；
-- collective 要知道真实 token distribution；
-- output feedback 要反向推进 scheduler；
-- MoE backend 要和 mapping/top-k/expert weight layout 一致。
+```text
+Scheduler/KV 20% + split parallelism 20% + MLA 20% = 总收益 60%。
+```
 
-因此当前结论是：
+应该写：
 
-1. TokenSpeed 具备架构级竞争力候选，尤其在 Scheduler/KV、EventLoop、split parallelism 三条主线上。
-2. SMG 应作为 agent runtime 入口层单独讲，但不要把 parser 夸大为护城河。
-3. local-SPMD / placement compiler 是支撑并行策略长期扩展的工程机制，不是 DeepSeek V4 当前主性能来源。
-4. MLA / latent-KV execution 比重应较小，重点介绍实现和迁移边界。
-5. 报告的主线应是：TokenSpeed 是否形成了一个更适合 agentic MoE serving 的 runtime，而不是是否有若干 vLLM 也能加的功能点。
+```text
+这些优化会在不同 workload 区间接管主瓶颈；
+最终收益取决于 agent 多轮 prefix 比例、decode step 长度、MoE token skew、
+KV pressure 和目标硬件 collective/kernel 效率。
+```
+
+## 7. 报告应该如何组织
+
+正式 PPT/报告建议按这个结构讲：
+
+1. **整体架构实现对比**
+   - TokenSpeed：SMG + C++ Scheduler/KV + Python execution；
+   - vLLM：API server + EngineCore + GPU workers；
+   - TensorRT-LLM：C++ Executor + TensorRT engine + IFB。
+
+2. **Agent workload 问题一：CPU 高负载**
+   - TokenSpeed 的 C++ Scheduler/EventLoop；
+   - vLLM V1 的 EngineCore / persistent batch；
+   - TensorRT-LLM 的 CUDA Graph / Overlap Scheduler；
+   - 结论：TokenSpeed 不是明显领先。
+
+3. **Agent workload 问题二：KV 管理**
+   - TokenSpeed 的 request FSM + KV ownership；
+   - vLLM 的 KVCacheManager / APC / hybrid cache；
+   - TensorRT-LLM 的 KV reuse / offload / event API；
+   - 结论：TokenSpeed 有强候选，但要限定为 lifecycle protocol。
+
+4. **最终竞争力判断**
+   - 单点功能不够；
+   - CPU 高负载不是明显优势；
+   - KV lifecycle 是最大候选；
+   - split parallelism 是第二候选；
+   - MLA/kernel 比重降低。
+
+## 8. 外部资料索引
+
+- vLLM V1 architecture: https://docs.vllm.ai/en/stable/design/arch_overview/
+- vLLM V1 guide: https://docs.vllm.ai/en/stable/usage/v1_guide/
+- vLLM V1 blog: https://vllm.ai/blog/2025-01-27-v1-alpha-release
+- vLLM prefix caching: https://docs.vllm.ai/en/v0.11.1/design/prefix_caching/
+- vLLM hybrid KV cache manager: https://docs.vllm.ai/en/stable/design/hybrid_kv_cache_manager/
+- vLLM disaggregated prefill: https://docs.vllm.ai/en/v0.12.0/features/disagg_prefill/
+- TensorRT-LLM architecture: https://nvidia.github.io/TensorRT-LLM/architecture/overview.html
+- TensorRT-LLM Executor API: https://nvidia.github.io/TensorRT-LLM/advanced/executor.html
+- TensorRT-LLM scheduler: https://nvidia.github.io/TensorRT-LLM/torch/scheduler.html
+- TensorRT-LLM KV cache system: https://nvidia.github.io/TensorRT-LLM/features/kvcache.html
+- TensorRT-LLM KV cache reuse: https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/legacy/advanced/kv-cache-reuse.md
+- NVIDIA KV cache reuse optimizations: https://developer.nvidia.com/blog/introducing-new-kv-cache-reuse-optimizations-in-nvidia-tensorrt-llm/
